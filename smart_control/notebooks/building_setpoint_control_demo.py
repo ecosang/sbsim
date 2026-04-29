@@ -53,14 +53,20 @@ import sys
 # Numeric / plotting
 import matplotlib
 import matplotlib.colors as mcolors
-from matplotlib.gridspec import GridSpec
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-# Make sure the repo root is on the path so simulator modules are importable
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+# Make sure the repo root is on the path so simulator modules are importable.
+# In a Jupyter notebook __file__ is not defined; we fall back to cwd which
+# should be the repo root when launching jupyter from the repo directory.
+try:
+  _nb_dir = os.path.dirname(os.path.abspath(__file__))
+  REPO_ROOT = os.path.abspath(os.path.join(_nb_dir, "..", ".."))
+except NameError:
+  REPO_ROOT = os.path.abspath(os.getcwd())
+
 if REPO_ROOT not in sys.path:
   sys.path.insert(0, REPO_ROOT)
 
@@ -72,7 +78,6 @@ from smart_control.simulator import boiler as boiler_py
 from smart_control.simulator import building as building_py
 from smart_control.simulator import hvac_floorplan_based as floorplan_hvac_py
 from smart_control.simulator import setpoint_schedule as setpoint_schedule_py
-from smart_control.simulator import simulator_flexible_floor_plan as simulator_py
 from smart_control.simulator import step_function_occupancy as occupancy_py
 from smart_control.simulator import weather_controller as weather_controller_py
 
@@ -81,11 +86,11 @@ from smart_control.simulator import weather_controller as weather_controller_py
 # Convenience constant
 KELVIN_TO_CELSIUS = 273.15
 
-print('All imports OK.')
+print("All imports OK.")
 print(
-    f'NumPy {np.__version__}, '
-    f'Pandas {pd.__version__}, '
-    f'Matplotlib {matplotlib.__version__}'
+    f"NumPy {np.__version__}, "
+    f"Pandas {pd.__version__}, "
+    f"Matplotlib {matplotlib.__version__}"
 )
 
 # %% [markdown]
@@ -132,105 +137,131 @@ FLOOR_PLAN = np.array([
     [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],  # row 22  exterior bottom
 ])
 
-print(f'Floor plan shape: {FLOOR_PLAN.shape}  (rows × cols)')
-print(f'Air cells  (code 0): {(FLOOR_PLAN == 0).sum()}')
-print(f'Wall cells (code 1): {(FLOOR_PLAN == 1).sum()}')
-print(f'Ext. cells (code 2): {(FLOOR_PLAN == 2).sum()}')
+print(f"Floor plan shape: {FLOOR_PLAN.shape}  (rows × cols)")
+print(f"Air cells  (code 0): {(FLOOR_PLAN == 0).sum()}")
+print(f"Wall cells (code 1): {(FLOOR_PLAN == 1).sum()}")
+print(f"Ext. cells (code 2): {(FLOOR_PLAN == 2).sum()}")
 
 # %%
 # ── Visualise the floor plan ──────────────────────────────────────────────────
 fig_fp, ax_fp = plt.subplots(figsize=(7, 10))
 
 # Custom discrete colormap: exterior=charcoal, interior wall=silver, air=white
-cmap_fp = mcolors.ListedColormap(['white', '#aaaaaa', '#444444'])
+cmap_fp = mcolors.ListedColormap(["white", "#aaaaaa", "#444444"])
 bounds_fp = [-0.5, 0.5, 1.5, 2.5]
 norm_fp = mcolors.BoundaryNorm(bounds_fp, cmap_fp.N)
 
 ax_fp.imshow(
-    FLOOR_PLAN, cmap=cmap_fp, norm=norm_fp, origin='upper', aspect='equal'
+    FLOOR_PLAN, cmap=cmap_fp, norm=norm_fp, origin="upper", aspect="equal"
 )
 
 # Annotate zones
 ax_fp.text(
     5.5,
     6.5,
-    'room_1\n(zone 1)',
-    ha='center',
-    va='center',
+    "room_1\n(zone 1)",
+    ha="center",
+    va="center",
     fontsize=12,
-    color='steelblue',
-    fontweight='bold',
+    color="steelblue",
+    fontweight="bold",
 )
 ax_fp.text(
     5.5,
     15.5,
-    'room_2\n(zone 2)',
-    ha='center',
-    va='center',
+    "room_2\n(zone 2)",
+    ha="center",
+    va="center",
     fontsize=12,
-    color='darkorange',
-    fontweight='bold',
+    color="darkorange",
+    fontweight="bold",
 )
 
 # Legend
 legend_patches = [
-    mpatches.Patch(color='white', label='Air (code 0) – room space'),
+    mpatches.Patch(color="white", label="Air (code 0) – room space"),
     mpatches.Patch(
-        color='#aaaaaa', label='Wall (code 1) – interior / corridor'
+        color="#aaaaaa", label="Wall (code 1) – interior / corridor"
     ),
-    mpatches.Patch(color='#444444', label='Wall (code 2) – exterior envelope'),
+    mpatches.Patch(color="#444444", label="Wall (code 2) – exterior envelope"),
 ]
 ax_fp.legend(
-    handles=legend_patches, loc='upper right', fontsize=9, framealpha=0.9
+    handles=legend_patches, loc="upper right", fontsize=9, framealpha=0.9
 )
 
 ax_fp.set_title(
-    'Two-Zone Office Building – Floor Plan\n'
-    '(23 × 12 control-volume grid, cv_size = 20 cm)',
+    "Two-Zone Office Building – Floor Plan\n"
+    "(23 × 12 control-volume grid, cv_size = 20 cm)",
     fontsize=12,
 )
-ax_fp.set_xlabel('Column index (East–West)')
-ax_fp.set_ylabel('Row index (North–South)')
+ax_fp.set_xlabel("Column index (East–West)")
+ax_fp.set_ylabel("Row index (North–South)")
 plt.tight_layout()
-plt.savefig('floor_plan.png', dpi=120, bbox_inches='tight')
 plt.show()
-print('Floor plan saved to floor_plan.png')
 
 # %% [markdown]
-# ## Section 2 – Building Construction
+# ## Section 2 – Building Construction & HVAC Sizing
 #
-# `FloorPlanBasedBuilding` discretises the floor plan into a grid of Control
-# Volumes (CVs). Each CV holds a temperature (`building.temp`) and
-# heat-injection rate (`building.input_q`).
+# ### Material properties
 #
-# Material properties chosen to be realistic for a lightweight office building:
+# We use the **default** material properties from `building.py` so that the
+# building envelope responds realistically to weather:
 #
-# | Layer | Conductivity (W/m·K) | Heat cap (J/kg·K) | Density (kg/m³) |
-# |-------|---------------------|-------------------|-----------------|
-# | Air   | 50 (effective)      | 700               | 1.0             |
-# | Int. wall | 5.0             | 800               | 1 800           |
-# | Ext. wall | 0.3 (insulated) | 800               | 3 000           |
+# | Layer      | k (W/m·K) | cp (J/kg·K) | rho (kg/m³) |
+# |------------|-----------|-------------|-------------|
+# | Air        | 50.0      | 700         | 1.2         |
+# | Int. wall  | 2.0       | 1 000       | 1 800       |
+# | Ext. wall  | 0.05      | 1 000       | 3 000       |
+#
+# ### Building geometry (from floor plan)
+#
+# - **Air cells** (code 0): 96 CVs → each 0.20 m × 0.20 m → floor area
+#   = 96 × 0.04 = 3.84 m²
+# - **Floor height**: 3.0 m → building volume = 3.84 × 3.0 = 11.52 m³
+# - **Exterior perimeter** (code 2): top row 12 + bottom row 12 +
+#   left col 23 + right col 23 − 4 corners = 66 CVs →
+#   envelope area ≈ 66 × 0.20 × 3.0 = 39.6 m²
+#
+# ### Rule-of-thumb HVAC sizing
+#
+# Peak envelope heat loss (winter, ΔT = 25 K):
+#
+# $$Q_{loss} = U \times A_{env} \times \Delta T$$
+#
+# With exterior conductivity k = 0.05 W/m·K and wall thickness
+# = 2 × 0.20 m = 0.40 m (two layers of exterior CV):
+#
+# $$U = k / d = 0.05 / 0.40 = 0.125\ \text{W/m²·K}$$
+# $$Q_{loss} = 0.125 \times 39.6 \times 25 \approx 124\ \text{W}$$
+#
+# But we also need to overcome the **thermal mass** of interior walls
+# (≈ 168 wall CVs × 0.04 m² × 3.0 m × 1800 kg/m³ × 1000 J/kg·K)
+# during warm-up.  We size the HVAC at **~10× steady-state** to get
+# reasonable warm-up / cool-down within a few hours:
+#
+# $$Q_{HVAC,design} \approx 2{-}5\ \text{kW per zone}$$
 
 # %%
 # ── Shared building parameters ────────────────────────────────────────────────
 CV_SIZE_CM = 20.0  # control-volume side length [cm]
 FLOOR_HEIGHT_CM = 300.0  # floor-to-ceiling height [cm]
 
-inside_air_props = building_py.MaterialProperties(
-    conductivity=50.0,  # effective air conductivity (natural convection)
-    heat_capacity=700.0,  # J/kg·K
-    density=1.0,  # kg/m³ (air)
-)
-inside_wall_props = building_py.MaterialProperties(
-    conductivity=5.0,
-    heat_capacity=800.0,
-    density=1800.0,
-)
-building_exterior_props = building_py.MaterialProperties(
-    conductivity=0.3,  # well-insulated exterior (≈ R-20 equivalent)
-    heat_capacity=800.0,
-    density=3000.0,
-)
+# Use DEFAULT material properties from building.py
+inside_air_props = building_py.DefaultInsideAirMaterialProperties()
+inside_wall_props = building_py.DefaultInsideWallMaterialProperties()
+building_exterior_props = building_py.DefaultExteriorWallMaterialProperties()
+
+print("=== Material Properties ===")
+for label, props in [
+    ("Air", inside_air_props),
+    ("Interior wall", inside_wall_props),
+    ("Exterior wall", building_exterior_props),
+]:
+  print(
+      f"  {label:15s}: k={props.conductivity:.2f} W/m·K, "
+      f"c={props.heat_capacity:.0f} J/kg·K, "
+      f"ρ={props.density:.0f} kg/m³"
+  )
 
 
 def create_building(
@@ -253,54 +284,156 @@ def create_building(
 
 # Quick smoke-test
 _bld_test = create_building(293.0)
-# get_zone_average_temps() returns only real room zones (room_1, room_2, ...)
-# _room_dict also contains 'exterior_space' and 'interior_wall' – exclude them.
 ROOM_ZONES = sorted(_bld_test.get_zone_average_temps())
-print(f'Actual room zones     : {ROOM_ZONES}')
-print(f'Temperature grid shape: {_bld_test.temp.shape}')
-print(f'Initial zone temps (K): {_bld_test.get_zone_average_temps()}')
+print(f"\nActual room zones     : {ROOM_ZONES}")
+print(f"Temperature grid shape: {_bld_test.temp.shape}")
+print(f"Initial zone temps (K): {_bld_test.get_zone_average_temps()}")
+
+# ── HVAC sizing calculations ─────────────────────────────────────────────────
+N_AIR_CELLS = int((FLOOR_PLAN == 0).sum())
+N_ZONES = len(ROOM_ZONES)
+CV_SIZE_M = CV_SIZE_CM / 100.0
+FLOOR_HEIGHT_M = FLOOR_HEIGHT_CM / 100.0
+FLOOR_AREA_M2 = N_AIR_CELLS * CV_SIZE_M * CV_SIZE_M
+BUILDING_VOLUME_M3 = FLOOR_AREA_M2 * FLOOR_HEIGHT_M
+
+# Exterior wall envelope area (code-2 cells form a perimeter rectangle)
+N_EXT_CELLS = int((FLOOR_PLAN == 2).sum())
+ENVELOPE_AREA_M2 = N_EXT_CELLS * CV_SIZE_M * FLOOR_HEIGHT_M
+
+# U-value of exterior wall (2 CV layers thick)
+EXT_WALL_THICKNESS_M = 2.0 * CV_SIZE_M  # enlarged exterior = 2 layers
+U_WALL = building_exterior_props.conductivity / EXT_WALL_THICKNESS_M
+
+# Design ΔT
+DESIGN_DT_HEATING = 25.0  # K (indoor 20°C, outdoor -5°C)
+DESIGN_DT_COOLING = 15.0  # K (indoor 22°C, outdoor 37°C)
+
+Q_LOSS_HEATING_W = U_WALL * ENVELOPE_AREA_M2 * DESIGN_DT_HEATING
+Q_LOSS_COOLING_W = U_WALL * ENVELOPE_AREA_M2 * DESIGN_DT_COOLING
+
+# Oversize factor to handle thermal mass warm-up/cool-down
+OVERSIZE_FACTOR = 15.0
+Q_DESIGN_HEATING_W = Q_LOSS_HEATING_W * OVERSIZE_FACTOR
+Q_DESIGN_COOLING_W = Q_LOSS_COOLING_W * OVERSIZE_FACTOR
+
+print("\n=== HVAC Sizing ===")
+print(f"  Air cells: {N_AIR_CELLS}, Zones: {N_ZONES}")
+print(f"  Floor area: {FLOOR_AREA_M2:.2f} m²")
+print(f"  Building volume: {BUILDING_VOLUME_M3:.2f} m³")
+print(
+    f"  Exterior CVs: {N_EXT_CELLS}, Envelope area: {ENVELOPE_AREA_M2:.1f} m²"
+)
+print(f"  Ext. wall thickness: {EXT_WALL_THICKNESS_M:.2f} m")
+print(f"  U_wall: {U_WALL:.4f} W/m²·K")
+print(
+    f"  Steady-state heat loss (ΔT={DESIGN_DT_HEATING}K): "
+    f"{Q_LOSS_HEATING_W:.0f} W"
+)
+print(
+    f"  Design heating capacity ({OVERSIZE_FACTOR}×): "
+    f"{Q_DESIGN_HEATING_W:.0f} W = {Q_DESIGN_HEATING_W/1000:.1f} kW"
+)
+print(
+    f"  Design cooling capacity ({OVERSIZE_FACTOR}×): "
+    f"{Q_DESIGN_COOLING_W:.0f} W = {Q_DESIGN_COOLING_W/1000:.1f} kW"
+)
+
+# Diffuser check
+print("\n=== Diffuser Check ===")
+print(f"  Diffuser sum: {_bld_test.diffusers.sum():.3f}")
+print(f"  Non-zero diffuser cells: {(_bld_test.diffusers > 0).sum()}")
+for z in ROOM_ZONES:
+  zone_coords = _bld_test._room_dict[z]  # pylint: disable=protected-access
+  diff_sum = sum(
+      _bld_test.diffusers[c] for c in zone_coords if _bld_test.diffusers[c] > 0
+  )
+  n_diff = sum(1 for c in zone_coords if _bld_test.diffusers[c] > 0)
+  print(f"  {z}: {n_diff} diffusers, weight sum = {diff_sum:.4f}")
 
 # %% [markdown]
-# ## Section 3 – HVAC Configuration
+# ## Section 3 – HVAC Configuration (sized to building)
 #
-# The HVAC hierarchy:
+# ### HVAC hierarchy
 # ```
 # FloorPlanBasedHvac
-# ├── Boiler        – hot water loop for heating
-# ├── AirHandler    – supply air conditioning (cooling)
-# └── VAV × N zones – variable-air-volume terminal units with thermostat
-#       └── SetpointSchedule – comfort (9am-6pm) vs eco (nights/weekends)
+# ├── Boiler        – hot water loop for VAV reheat
+# ├── AirHandler    – mixed / conditioned supply air
+# └── VAV × N zones – variable-air-volume with thermostat
+#       └── SetpointSchedule – comfort (9am–6pm) vs eco
 # ```
-# Parameters are taken from `_create_scenario_hvac()` in the test suite and
-# cross-checked with the SAC Demo notebook.
+#
+# ### Sizing approach
+#
+# From Section 2 we computed the design heating load.  The VAV delivers
+# heat to each zone via:
+#
+# $$q_{zone} = \dot{m}_{air} \cdot c_{air} \cdot (T_{supply} - T_{zone})$$
+#
+# The simulator treats `max_air_flow_rate` as volumetric (m³/s) and
+# multiplies by `AIR_HEAT_CAPACITY = 1006 J/kg·K` directly (i.e. assumes
+# ρ ≈ 1 kg/m³ implicitly).  We size the VAV air and water flows so that
+# the per-zone capacity ≈ `Q_DESIGN_HEATING_W / N_ZONES`.
+#
+# | Device | Parameter | Value | Rationale |
+# |--------|-----------|-------|-----------|
+# | Boiler | `reheat_water_setpoint` | 350 K (77 °C) | Standard HW |
+# | AHU | `heating_air_temp_setpoint` | 292 K | Min supply air |
+# | AHU | `cooling_air_temp_setpoint` | 300 K | Max supply air |
+# | AHU | `recirculation` | 0.3 | 30 % return air |
+# | AHU | `max_air_flow_rate` | 2.0 m³/s | Building total |
+# | VAV | `max_air_flow_rate` | 0.50 m³/s | Per zone |
+# | VAV | `reheat_max_water_flow_rate` | 0.10 kg/s | Per zone |
 
 # %%
 # ── Setpoint schedule ─────────────────────────────────────────────────────────
-HEATING_SETPOINT_K = 292.0  # 18.85 °C
-COOLING_SETPOINT_K = 295.0  # 21.85 °C
-ECO_LOW_K = 290.0  # 16.85 °C  (unoccupied / setback)
-ECO_HIGH_K = 297.0  # 23.85 °C
+HEATING_SETPOINT_K = 292.0  # 18.85 °C  comfort heating
+COOLING_SETPOINT_K = 297.0  # 23.85 °C  comfort cooling
+ECO_LOW_K = 288.0  # 14.85 °C  eco / setback
+ECO_HIGH_K = 300.0  # 26.85 °C  eco / setback
+
+# ── Properly-sized HVAC parameters ───────────────────────────────────────────
+BOILER_SUPPLY_WATER_SP_K = 350.0  # 77 °C
+BOILER_PUMP_HEAD = 3.0  # [m]
+BOILER_PUMP_EFFICIENCY = 0.6
+AHU_RECIRCULATION = 0.3  # 30% return air → more outdoor air for cooling
+AHU_HEAT_SP_K = 292.0  # mixed supply air heating SP [K]
+AHU_COOL_SP_K = 300.0  # mixed supply air cooling SP [K]
+AHU_FAN_PRESSURE = 500.0  # [Pa] realistic duct static pressure
+AHU_FAN_EFFICIENCY = 0.8
+AHU_MAX_AIR_FLOW = 2.0  # [m³/s] total building capacity
+
+# Per-zone VAV sizing
+# q_zone = air_flow * C_air * (T_supply - T_zone) + water contribution
+# With air=0.5, C_air=1006, ΔT≈20K → q ≈ 0.5*1006*20 = 10,060 W ≈ 10 kW
+# With water=0.10, C_water=4180, ΔT_water≈60K → additional 25 kW capacity
+VAV_MAX_AIR_FLOW = 0.50  # [m³/s] per zone
+VAV_MAX_WATER_FLOW = 0.10  # [kg/s] per zone hot water
 
 
-def create_hvac(
-    zone_identifiers,
-) -> floorplan_hvac_py.FloorPlanBasedHvac:
+def create_hvac(zone_identifiers) -> floorplan_hvac_py.FloorPlanBasedHvac:
   """Build a fresh HVAC object wired to the given zone identifiers."""
+  new_boiler = boiler_py.Boiler(
+      reheat_water_setpoint=BOILER_SUPPLY_WATER_SP_K,
+      water_pump_differential_head=BOILER_PUMP_HEAD,
+      water_pump_efficiency=BOILER_PUMP_EFFICIENCY,
+      device_id="boiler_id",
+  )
+  # Fix: initialise return_water_temperature_sensor to ~supply setpoint
+  # instead of default 0 K to avoid artefact at step 0.
+  new_boiler.return_water_temperature_sensor = BOILER_SUPPLY_WATER_SP_K
+
   return floorplan_hvac_py.FloorPlanBasedHvac(
       zone_identifier=zone_identifiers,
       air_handler=air_handler_py.AirHandler(
-          recirculation=0.6,
-          heating_air_temp_setpoint=291.0,
-          cooling_air_temp_setpoint=295.0,
-          fan_differential_pressure=20000.0,
-          fan_efficiency=0.8,
+          recirculation=AHU_RECIRCULATION,
+          heating_air_temp_setpoint=AHU_HEAT_SP_K,
+          cooling_air_temp_setpoint=AHU_COOL_SP_K,
+          fan_differential_pressure=AHU_FAN_PRESSURE,
+          fan_efficiency=AHU_FAN_EFFICIENCY,
+          max_air_flow_rate=AHU_MAX_AIR_FLOW,
       ),
-      boiler=boiler_py.Boiler(
-          reheat_water_setpoint=350.0,
-          water_pump_differential_head=3.0,
-          water_pump_efficiency=0.6,
-          device_id='boiler_id',
-      ),
+      boiler=new_boiler,
       schedule=setpoint_schedule_py.SetpointSchedule(
           morning_start_hour=9,
           evening_start_hour=18,
@@ -308,880 +441,957 @@ def create_hvac(
           eco_temp_window=(ECO_LOW_K, ECO_HIGH_K),
           holidays={7, 223, 245},
       ),
-      vav_max_air_flow_rate=0.45,  # [m³/s] per zone
-      vav_reheat_max_water_flow_rate=0.02,  # [kg/s] per zone
+      vav_max_air_flow_rate=VAV_MAX_AIR_FLOW,
+      vav_reheat_max_water_flow_rate=VAV_MAX_WATER_FLOW,
   )
 
 
-# Quick check – pass only the real room zones
+# ── Sanity check: expected zone supply temperature in HEAT mode ──────────────
+print("=== HVAC Sanity Check ===")
+ahu_supply_approx = AHU_HEAT_SP_K
+c_air_flow = 1006 * VAV_MAX_AIR_FLOW
+c_water_flow = 4180 * VAV_MAX_WATER_FLOW
+zone_supply_est = (
+    ahu_supply_approx * c_air_flow + BOILER_SUPPLY_WATER_SP_K * c_water_flow
+) / (c_air_flow + c_water_flow)
+q_heat_est = c_air_flow * (zone_supply_est - 275.0)  # from 275K start
+print(f"  VAV_MAX_AIR_FLOW = {VAV_MAX_AIR_FLOW} m³/s per zone")
+print(f"  VAV_MAX_WATER_FLOW = {VAV_MAX_WATER_FLOW} kg/s per zone")
+print(
+    f"  C_air×flow = {c_air_flow:.0f} W/K   "
+    f"C_water×flow = {c_water_flow:.0f} W/K"
+)
+print(
+    "  Expected zone supply temp (HEAT): "
+    f"{zone_supply_est - KELVIN_TO_CELSIUS:.1f} °C"
+)
+print(f"  Estimated q_zone from 275K: {q_heat_est/1000:.1f} kW")
+
 _hvac_test = create_hvac(ROOM_ZONES)
-print('HVAC zones:', list(_hvac_test.vavs.keys()))
-sp_k = _hvac_test.boiler.reheat_water_setpoint
 print(
-    f'Boiler supply water setpoint : {sp_k:.1f} K'
-    f'  = {sp_k - KELVIN_TO_CELSIUS:.1f} °C'
+    "  Boiler supply SP: "
+    f"{_hvac_test.boiler.reheat_water_setpoint - KELVIN_TO_CELSIUS:.1f} °C"
 )
-print(
-    'Comfort band : '
-    f'[{HEATING_SETPOINT_K - KELVIN_TO_CELSIUS:.2f} °C, '
-    f'{COOLING_SETPOINT_K - KELVIN_TO_CELSIUS:.2f} °C]'
+boiler_rw = (
+    _hvac_test.boiler.return_water_temperature_sensor - KELVIN_TO_CELSIUS
 )
-print(
-    'Eco band     : '
-    f'[{ECO_LOW_K - KELVIN_TO_CELSIUS:.2f} °C, '
-    f'{ECO_HIGH_K - KELVIN_TO_CELSIUS:.2f} °C]'
-)
+print(f"  Boiler init RW sensor: {boiler_rw:.1f} °C")
 
 # %% [markdown]
 # ## Section 4 – Weather Controller
 #
-# `WeatherController` generates a **sinusoidal diurnal temperature cycle**:
-# minimum at midnight, maximum at noon.  We use two weekly profiles:
-#
-# * **Winter week** (Jan 10–16, 2024):
-#   low = 268 K (−5 °C), high = 277 K (4 °C)
-# * **Summer week** (Jul 15–21, 2024):
-#   low = 295 K (22 °C), high = 308 K (35 °C)
+# * **Winter**: low = 268 K (−5 °C), high = 277 K (4 °C)
+# * **Summer**: low = 295 K (22 °C), high = 308 K (35 °C)
 
 # %%
-# ── Weather controllers ───────────────────────────────────────────────────────
 wc_winter = weather_controller_py.WeatherController(
-    default_low_temp=268.0,  # K = –5 °C
-    default_high_temp=277.0,  # K =  4 °C
+    default_low_temp=268.0,
+    default_high_temp=277.0,
     convection_coefficient=12.0,
 )
-
 wc_summer = weather_controller_py.WeatherController(
-    default_low_temp=295.0,  # K = 22 °C
-    default_high_temp=308.0,  # K = 35 °C
+    default_low_temp=295.0,
+    default_high_temp=308.0,
     convection_coefficient=12.0,
 )
 
-# ── Plot 7-day ambient temperature profiles ───────────────────────────────────
-ts_range_w = pd.date_range('2024-01-10', periods=7 * 24 * 12, freq='5min')
+ts_range_w = pd.date_range("2024-01-10", periods=3 * 24 * 12, freq="5min")
 winter_temps = [
     wc_winter.get_current_temp(t) - KELVIN_TO_CELSIUS for t in ts_range_w
 ]
-
-ts_range_s = pd.date_range('2024-07-15', periods=7 * 24 * 12, freq='5min')
+ts_range_s = pd.date_range("2024-07-15", periods=3 * 24 * 12, freq="5min")
 summer_temps = [
     wc_summer.get_current_temp(t) - KELVIN_TO_CELSIUS for t in ts_range_s
 ]
 
-fig_wx, axes_wx = plt.subplots(2, 1, figsize=(14, 6), sharex=False)
-
 h_sp_c = HEATING_SETPOINT_K - KELVIN_TO_CELSIUS
 c_sp_c = COOLING_SETPOINT_K - KELVIN_TO_CELSIUS
 
-for ax_wx, ts_rng, temps, colour, label in [
+fig_wx, axes_wx = plt.subplots(2, 1, figsize=(14, 6), sharex=False)
+for ax_wx, ts_rng, temps, colour, ttl in [
     (
         axes_wx[0],
         ts_range_w,
         winter_temps,
-        'steelblue',
-        'Winter Week – Outdoor Temperature (Jan 10–16, 2024)',
+        "steelblue",
+        "Winter (Jan 10–12, 2024)",
     ),
     (
         axes_wx[1],
         ts_range_s,
         summer_temps,
-        'darkorange',
-        'Summer Week – Outdoor Temperature (Jul 15–21, 2024)',
+        "darkorange",
+        "Summer (Jul 15–17, 2024)",
     ),
 ]:
-  ax_wx.plot(ts_rng, temps, color=colour, lw=1.5, label='Outdoor temp')
+  ax_wx.plot(ts_rng, temps, color=colour, lw=1.5, label="Outdoor temp")
   ax_wx.axhline(
-      h_sp_c, color='red', ls='--', lw=1, label=f'Heating SP ({h_sp_c:.1f}°C)'
+      h_sp_c, color="red", ls="--", lw=1, label=f"Heating SP ({h_sp_c:.1f}°C)"
   )
   ax_wx.axhline(
       c_sp_c,
-      color='orange',
-      ls='--',
+      color="orange",
+      ls="--",
       lw=1,
-      label=f'Cooling SP ({c_sp_c:.1f}°C)',
+      label=f"Cooling SP ({c_sp_c:.1f}°C)",
   )
-  ax_wx.fill_between(
-      ts_rng,
-      h_sp_c,
-      c_sp_c,
-      alpha=0.15,
-      color='green',
-      label='Comfort band',
-  )
-  ax_wx.set_title(label, fontsize=11)
-  ax_wx.set_ylabel('Temperature [°C]')
-  ax_wx.legend(fontsize=9, loc='upper right')
+  ax_wx.set_title(ttl, fontsize=11)
+  ax_wx.set_ylabel("Temperature [°C]")
+  ax_wx.legend(fontsize=9)
   ax_wx.grid(True, alpha=0.4)
-
 plt.tight_layout()
-plt.savefig('weather_profiles.png', dpi=120, bbox_inches='tight')
 plt.show()
 
 # %% [markdown]
 # ## Section 5 – Occupancy Model
-#
-# `StepFunctionOccupancy` is a simple binary model:
-# * **Work hours** (9 am–5 pm, weekdays): 10 people per zone
-# * **Off hours / weekends**: 0.1 people per zone (background)
 
 # %%
 occupancy = occupancy_py.StepFunctionOccupancy(
-    work_start_time=pd.Timedelta(9, unit='h'),
-    work_end_time=pd.Timedelta(17, unit='h'),
+    work_start_time=pd.Timedelta(9, unit="h"),
+    work_end_time=pd.Timedelta(17, unit="h"),
     work_occupancy=10.0,
     nonwork_occupancy=0.1,
 )
 
-# Plot 2-day occupancy profile
-occ_times = pd.date_range('2024-01-10', periods=2 * 24 * 12, freq='5min')
+occ_times = pd.date_range("2024-01-10", periods=2 * 24 * 12, freq="5min")
 occ_vals = [
-    occupancy.average_zone_occupancy('room_1', occ_times[i], occ_times[i + 1])
+    occupancy.average_zone_occupancy("room_1", occ_times[i], occ_times[i + 1])
     for i in range(len(occ_times) - 1)
 ]
 
 fig_occ, ax_occ = plt.subplots(figsize=(12, 3))
-ax_occ.step(occ_times[:-1], occ_vals, where='post', color='teal', lw=2)
-ax_occ.fill_between(
-    occ_times[:-1], occ_vals, step='post', alpha=0.3, color='teal'
+ax_occ.plot(
+    occ_times[:-1],
+    occ_vals,
+    color="teal",
+    lw=2,
+    drawstyle="steps-post",
+    label="Occupancy",
 )
-ax_occ.set_title(
-    'Occupancy Profile – 2 Day Sample (Wednesday–Thursday)', fontsize=11
-)
-ax_occ.set_ylabel('Avg Occupants per Zone')
+ax_occ.set_ylabel("Avg Occupants/Zone")
 ax_occ.set_ylim(-0.5, 12)
+ax_occ.set_title("Occupancy – 2-Day Sample", fontsize=11)
+ax_occ.legend(fontsize=9)
 ax_occ.grid(True, alpha=0.4)
 plt.tight_layout()
-plt.savefig('occupancy_profile.png', dpi=120, bbox_inches='tight')
 plt.show()
 
-# %% [markdown]
-# ## Section 6 – Heating Scenario: 1-Week Winter Simulation
-#
-# **Setup:**
-# * Start time: Wednesday 2024-01-10 00:00 (middle of winter week)
-# * Initial building temperature: **275 K (2 °C)** – well below 292 K heating SP
-# * Ambient temperature: sinusoidal winter profile, max 277 K (4 °C)
-# * Result: thermostats stay in heating mode; boiler injects heat via VAVs
-#
-# Time step = 300 s (5 min).  7 days = 2 016 steps.
+# Also import TFSimulator
+# pylint: disable=wrong-import-position
+from smart_control.simulator import tf_simulator as tf_simulator_py
 
-# %%
-# ── Simulation helper ─────────────────────────────────────────────────────────
-
-
-def run_simulation(
-    bld: building_py.FloorPlanBasedBuilding,
-    hvac: floorplan_hvac_py.FloorPlanBasedHvac,
-    weather_ctrl: weather_controller_py.WeatherController,
-    occupancy_model: occupancy_py.StepFunctionOccupancy,
-    start_timestamp: pd.Timestamp,
-    n_days: int = 7,
-    time_step_sec: float = 300.0,
-    convergence_threshold: float = 0.1,
-    iteration_limit: int = 100,
-    progress_every: int = 200,
-) -> pd.DataFrame:
-  """Run the simulator and collect per-step timeseries data.
-
-  Returns a DataFrame with columns:
-      timestamp, zone_id, zone_temp_k, zone_temp_c,
-      heating_sp_k, cooling_sp_k, heating_sp_c, cooling_sp_c,
-      is_comfort_mode, occupancy, boiler_gas_rate_w, fan_elec_rate_w,
-      outdoor_temp_k, outdoor_temp_c
-  """
-  sim = simulator_py.SimulatorFlexibleGeometries(
-      building=bld,
-      hvac=hvac,
-      weather_controller=weather_ctrl,
-      time_step_sec=time_step_sec,
-      convergence_threshold=convergence_threshold,
-      iteration_limit=iteration_limit,
-      iteration_warning=10,
-      start_timestamp=start_timestamp,
-  )
-
-  n_steps = int(n_days * 24 * 3600 / time_step_sec)
-  # get_zone_average_temps() returns only real room zones
-  zone_ids = sorted(bld.get_zone_average_temps())
-  # All VAVs share the same SetpointSchedule; use first zone as reference
-  ref_zone = zone_ids[0]
-  records = []
-
-  for step in range(n_steps):
-    ts = sim.current_timestamp
-
-    # Setpoints and comfort mode from thermostat schedule
-    sp_schedule = hvac.vavs[ref_zone].thermostat.get_setpoint_schedule()
-    h_sp, c_sp = sp_schedule.get_temperature_window(ts)
-    is_comfort = sp_schedule.is_comfort_mode(ts)
-    outdoor_k = weather_ctrl.get_current_temp(ts)
-
-    # Zone temperatures before the step (only real room zones)
-    zone_temps = bld.get_zone_average_temps()
-
-    # HVAC energy rates from the current device state
-    boiler_gas_w = hvac.boiler.compute_thermal_energy_rate(
-        hvac.boiler.return_water_temperature_sensor, outdoor_k
-    )
-    fan_elec_w = (
-        hvac.air_handler.compute_intake_fan_energy_rate()
-        + hvac.air_handler.compute_exhaust_fan_energy_rate()
-    )
-
-    for zone_id in zone_ids:
-      zone_temp_k = zone_temps[zone_id]
-      occ = occupancy_model.average_zone_occupancy(
-          zone_id, ts, ts + pd.Timedelta(time_step_sec, unit='s')
-      )
-      records.append({
-          'timestamp': ts,
-          'zone_id': zone_id,
-          'zone_temp_k': zone_temp_k,
-          'zone_temp_c': zone_temp_k - KELVIN_TO_CELSIUS,
-          'heating_sp_k': h_sp,
-          'cooling_sp_k': c_sp,
-          'heating_sp_c': h_sp - KELVIN_TO_CELSIUS,
-          'cooling_sp_c': c_sp - KELVIN_TO_CELSIUS,
-          'is_comfort_mode': int(is_comfort),
-          'occupancy': occ,
-          'boiler_gas_rate_w': boiler_gas_w,
-          'fan_elec_rate_w': fan_elec_w,
-          'outdoor_temp_k': outdoor_k,
-          'outdoor_temp_c': outdoor_k - KELVIN_TO_CELSIUS,
-      })
-
-    # Advance the simulation one step
-    sim.step_sim()
-
-    if progress_every and (step + 1) % progress_every == 0:
-      avg_t = np.mean(list(bld.get_zone_average_temps().values()))
-      print(
-          f'  step {step + 1:4d}/{n_steps}'
-          f' | ts={ts.strftime("%m-%d %H:%M")}'
-          f' | avg zone T = {avg_t - KELVIN_TO_CELSIUS:.2f} °C'
-          f' | outdoor = {outdoor_k - KELVIN_TO_CELSIUS:.2f} °C'
-      )
-
-  return pd.DataFrame(records)
-
+# pylint: enable=wrong-import-position
 
 # %% [markdown]
-# ### Run Heating Scenario
+# ## Section 6 – TFSimulator: Heating Scenario (3-day)
+#
+# 3-day winter simulation with properly sized HVAC.  The 12-row debug
+# figure collects all key signals for diagnosing HVAC behaviour.
 
 # %%
-print('=' * 60)
-print('HEATING SCENARIO  – Winter week, building starts at 275 K (2°C)')
-print('=' * 60)
-
-INITIAL_TEMP_HEATING = 275.0  # K – cold building, below heating setpoint
-START_TS_WINTER = pd.Timestamp('2024-01-10 00:00:00')  # Wednesday
+INITIAL_TEMP_HEATING = 275.0
+START_TS_WINTER = pd.Timestamp("2024-01-10 00:00:00")
+N_DAYS = 3
+TIME_STEP_SEC = 300.0
+N_STEPS = int(N_DAYS * 24 * 3600 / TIME_STEP_SEC)
 
 bld_heat = create_building(INITIAL_TEMP_HEATING)
-# Pass only actual room zones (get_zone_average_temps excludes other entries)
 hvac_heat = create_hvac(sorted(bld_heat.get_zone_average_temps()))
+ZONE_IDS = sorted(bld_heat.get_zone_average_temps())
+REF_ZONE = ZONE_IDS[0]
 
-df_heat = run_simulation(
-    bld=bld_heat,
+sim_heat = tf_simulator_py.TFSimulator(
+    building=bld_heat,
     hvac=hvac_heat,
-    weather_ctrl=wc_winter,
-    occupancy_model=occupancy,
+    weather_controller=wc_winter,
+    time_step_sec=TIME_STEP_SEC,
+    convergence_threshold=0.1,
+    iteration_limit=100,
+    iteration_warning=10,
     start_timestamp=START_TS_WINTER,
-    n_days=7,
-    time_step_sec=300.0,
-    progress_every=200,
 )
 
-print(f'\nHeating simulation complete. Records: {len(df_heat):,}')
-print(df_heat.head(4).to_string(index=False))
-
-# %% [markdown]
-# ## Section 7 – Data Collection and Summary (Heating)
-
-# %%
-# Pivot for easy zone-by-zone access
-heat_pivot = df_heat.pivot_table(
-    index='timestamp', columns='zone_id', values='zone_temp_c', aggfunc='first'
+print(
+    "TFSimulator HEATING init. Mean zone T = "
+    f"{bld_heat.temp.mean() - KELVIN_TO_CELSIUS:.2f} °C"
 )
+# ── Per-step data storage ────────────────────────────────────────────────────
+ts_heat = []
+zone_temp_h = {z: [] for z in ZONE_IDS}
+h_sp_h, c_sp_h, mode_h = [], [], []
+damper_h = {z: [] for z in ZONE_IDS}
+reheat_v_h = {z: [] for z in ZONE_IDS}
+zone_supply_temp_h = {z: [] for z in ZONE_IDS}
+q_zone_h = {z: [] for z in ZONE_IDS}
+ahu_supply_h = []
+ahu_flow_h = []
+boiler_sw_h = []
+boiler_rw_h = []
+boiler_gas_h = []
+fan_elec_h = []
+outdoor_h = []
 
-# Derive hourly aggregates
-heat_hourly = (
-    df_heat.set_index('timestamp')
-    .groupby([pd.Grouper(freq='1h'), 'zone_id'])
-    .agg(
-        zone_temp_c=('zone_temp_c', 'mean'),
-        heating_sp_c=('heating_sp_c', 'first'),
-        cooling_sp_c=('cooling_sp_c', 'first'),
-        occupancy=('occupancy', 'mean'),
-        boiler_gas_rate_w=('boiler_gas_rate_w', 'mean'),
-        fan_elec_rate_w=('fan_elec_rate_w', 'mean'),
-        outdoor_temp_c=('outdoor_temp_c', 'mean'),
-        is_comfort_mode=('is_comfort_mode', 'first'),
+for step in range(N_STEPS):
+  ts = sim_heat.current_timestamp
+  outdoor_k = wc_winter.get_current_temp(ts)
+  rec_temp = bld_heat.temp.mean()
+  ahu_supply_k = hvac_heat.air_handler.get_supply_air_temp(rec_temp, outdoor_k)
+
+  ts_heat.append(ts)
+  sched = hvac_heat.vavs[REF_ZONE].thermostat.get_setpoint_schedule()
+  h_sp, c_sp = sched.get_temperature_window(ts)
+  h_sp_h.append(h_sp)
+  c_sp_h.append(c_sp)
+  # pylint: disable=protected-access
+  mode_h.append(hvac_heat.vavs[REF_ZONE].thermostat._current_mode.value)
+  # pylint: enable=protected-access
+
+  zone_avgs = bld_heat.get_zone_average_temps()
+  for zid in ZONE_IDS:
+    zone_temp_h[zid].append(zone_avgs[zid] - KELVIN_TO_CELSIUS)
+    damper_h[zid].append(hvac_heat.vavs[zid].damper_setting)
+    reheat_v_h[zid].append(hvac_heat.vavs[zid].reheat_valve_setting)
+    zst_k = hvac_heat.vavs[zid].compute_zone_supply_temp(
+        ahu_supply_k, hvac_heat.boiler.reheat_water_setpoint
     )
-    .reset_index()
-)
+    zone_supply_temp_h[zid].append(zst_k - KELVIN_TO_CELSIUS)
+    q_w = hvac_heat.vavs[zid].compute_energy_applied_to_zone(
+        zone_avgs[zid], ahu_supply_k, hvac_heat.boiler.reheat_water_setpoint
+    )
+    q_zone_h[zid].append(q_w / 1000)
 
-print('Hourly summary – first 3 rows:')
-print(heat_hourly.head(3).to_string(index=False))
+  ahu_supply_h.append(ahu_supply_k - KELVIN_TO_CELSIUS)
+  ahu_flow_h.append(hvac_heat.air_handler.air_flow_rate)
 
-# Zone temperature statistics
-print('\nZone temperature statistics (°C) over entire heating week:')
-print(df_heat.groupby('zone_id')['zone_temp_c'].describe().round(2).to_string())
+  rw_k = hvac_heat.boiler.return_water_temperature_sensor
+  boiler_sw_h.append(
+      hvac_heat.boiler.supply_water_temperature_sensor - KELVIN_TO_CELSIUS
+  )
+  boiler_rw_h.append(rw_k - KELVIN_TO_CELSIUS)
+  boiler_gas_h.append(
+      hvac_heat.boiler.compute_thermal_energy_rate(rw_k, outdoor_k) / 1000
+  )
+  fan_elec_h.append(
+      (
+          hvac_heat.air_handler.compute_intake_fan_energy_rate()
+          + hvac_heat.air_handler.compute_exhaust_fan_energy_rate()
+      )
+      / 1000
+  )
+  outdoor_h.append(outdoor_k - KELVIN_TO_CELSIUS)
+
+  sim_heat.step_sim()
+
+  if (step + 1) % 288 == 0:
+    avg_t = sum(bld_heat.get_zone_average_temps().values()) / len(ZONE_IDS)
+    print(
+        f'  Day {(step+1)//288} | {ts.strftime("%m-%d %H:%M")}'
+        f" | mean T={avg_t - KELVIN_TO_CELSIUS:.2f} °C"
+        f" | outdoor={outdoor_k - KELVIN_TO_CELSIUS:.2f} °C"
+        f" | mode={mode_h[-1]}"
+    )
+
+print("Heating simulation complete.")
 
 # %% [markdown]
-# ## Section 8 – Heating Scenario Visualisations
+# ## Section 7 – Heating Scenario: 12-Row Debug Visualisation
 #
-# Four panels:
-# 1. Zone temperatures vs. comfort setpoint band, with outdoor temp
-# 2. HVAC energy rates (boiler gas + fan electricity)
-# 3. Occupancy schedule (step function)
-# 4. Floor-plan temperature heatmaps at 4 snapshots in time
-
+# Mode legend: 0 = OFF, 1 = HEAT, 2 = COOL, 3 = PASSIVE\_COOL
 
 # %%
-def plot_scenario(
-    df: pd.DataFrame,
-    bld_final: building_py.FloorPlanBasedBuilding,
-    title_prefix: str,
-    zone_colors: dict,
-    outdoor_color: str = 'purple',
-    heatmap_snapshots: list = None,
-):
-  """Plot a 4-panel figure for one simulation scenario."""
+ZONE_COLORS = {"room_1": "steelblue", "room_2": "darkorange"}
+TS_H = ts_heat
 
-  zone_list = sorted(df['zone_id'].unique())
-  n_snapshots = 4 if heatmap_snapshots is None else len(heatmap_snapshots)
+N_ROWS = 12
+fig_h, axes_h = plt.subplots(N_ROWS, 1, figsize=(18, N_ROWS * 3), sharex=True)
+fig_h.suptitle(
+    "Heating Scenario (Winter) – 3-Day Debug\n"
+    f"(VAV air={VAV_MAX_AIR_FLOW} m³/s, water={VAV_MAX_WATER_FLOW} kg/s, "
+    f"boiler={BOILER_SUPPLY_WATER_SP_K - KELVIN_TO_CELSIUS:.0f} °C)",
+    fontsize=13,
+)
 
-  fig_sc = plt.figure(figsize=(16, 22))
-  gs = GridSpec(4, n_snapshots, figure=fig_sc, hspace=0.45, wspace=0.35)
+# Row 0: Zone temperature vs. setpoints
+ax = axes_h[0]
+for zid in ZONE_IDS:
+  ax.plot(TS_H, zone_temp_h[zid], color=ZONE_COLORS[zid], lw=1.5, label=zid)
+ax.plot(
+    TS_H,
+    [t - KELVIN_TO_CELSIUS for t in h_sp_h],
+    color="red",
+    lw=1.2,
+    ls="--",
+    drawstyle="steps-post",
+    label="Heating SP",
+)
+ax.plot(
+    TS_H,
+    [t - KELVIN_TO_CELSIUS for t in c_sp_h],
+    color="orange",
+    lw=1.2,
+    ls="--",
+    drawstyle="steps-post",
+    label="Cooling SP",
+)
+ax.set_ylabel("Temp [°C]")
+ax.set_title("Zone Air Temperature vs. Setpoints")
+ax.legend(fontsize=8, ncol=4)
+ax.grid(True, alpha=0.3)
 
-  # ── Panel 1: Zone temperatures ────────────────────────────────────────────
-  ax1 = fig_sc.add_subplot(gs[0, :])
-  df_ref = df[df['zone_id'] == zone_list[0]]
-  h_sp_c_val = df_ref['heating_sp_c'].iloc[0]
-  c_sp_c_val = df_ref['cooling_sp_c'].iloc[0]
+# Row 1: Thermostat mode
+ax = axes_h[1]
+ax.plot(
+    TS_H,
+    mode_h,
+    color="purple",
+    lw=1.5,
+    drawstyle="steps-post",
+    label="Mode (0=OFF,1=HEAT,2=COOL,3=PASSIVE_COOL)",
+)
+ax.set_ylabel("Mode")
+ax.set_yticks([0, 1, 2, 3])
+ax.set_yticklabels(["OFF", "HEAT", "COOL", "P.COOL"])
+ax.set_title("Thermostat Mode")
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.3)
 
-  ax1.fill_between(
-      df_ref['timestamp'],
-      h_sp_c_val,
-      c_sp_c_val,
-      alpha=0.15,
-      color='green',
-      label='Comfort band',
-  )
-  ax1.axhline(
-      h_sp_c_val,
-      color='red',
-      ls='--',
+# Row 2: VAV damper
+ax = axes_h[2]
+for zid in ZONE_IDS:
+  ax.plot(
+      TS_H,
+      damper_h[zid],
+      color=ZONE_COLORS[zid],
       lw=1.2,
-      label=f'Heating SP ({h_sp_c_val:.1f}°C)',
+      drawstyle="steps-post",
+      label=f"{zid} damper",
   )
-  ax1.axhline(
-      c_sp_c_val,
-      color='orange',
-      ls='--',
+ax.set_ylabel("Damper [0-1]")
+ax.set_ylim(-0.05, 1.05)
+ax.set_title("VAV Damper Position")
+ax.legend(fontsize=8, ncol=2)
+ax.grid(True, alpha=0.3)
+
+# Row 3: VAV reheat valve
+ax = axes_h[3]
+for zid in ZONE_IDS:
+  ax.plot(
+      TS_H,
+      reheat_v_h[zid],
+      color=ZONE_COLORS[zid],
       lw=1.2,
-      label=f'Cooling SP ({c_sp_c_val:.1f}°C)',
+      drawstyle="steps-post",
+      label=f"{zid} reheat valve",
   )
+ax.set_ylabel("Reheat Valve [0-1]")
+ax.set_ylim(-0.05, 1.05)
+ax.set_title("VAV Reheat Valve Position")
+ax.legend(fontsize=8, ncol=2)
+ax.grid(True, alpha=0.3)
 
-  for zone_id in zone_list:
-    df_z = df[df['zone_id'] == zone_id].set_index('timestamp')
-    ax1.plot(
-        df_z.index,
-        df_z['zone_temp_c'],
-        lw=1.5,
-        color=zone_colors.get(zone_id, 'gray'),
-        label=zone_id,
-    )
-
-  # Outdoor temp on secondary y-axis
-  ax1r = ax1.twinx()
-  ax1r.plot(
-      df_ref['timestamp'],
-      df_ref['outdoor_temp_c'],
-      color=outdoor_color,
-      lw=1,
-      ls=':',
-      alpha=0.8,
-      label='Outdoor temp',
-  )
-  ax1r.set_ylabel('Outdoor Temp [°C]', color=outdoor_color, fontsize=10)
-  ax1r.tick_params(axis='y', labelcolor=outdoor_color)
-
-  ax1.set_title(
-      f'{title_prefix} – Zone Temperatures vs. Setpoints', fontsize=12
-  )
-  ax1.set_ylabel('Zone Air Temperature [°C]')
-  ax1.grid(True, alpha=0.3)
-  lines1, labels1 = ax1.get_legend_handles_labels()
-  lines2, labels2 = ax1r.get_legend_handles_labels()
-  ax1.legend(
-      lines1 + lines2,
-      labels1 + labels2,
-      loc='upper right',
-      fontsize=9,
-      ncol=3,
-  )
-
-  # ── Panel 2: HVAC energy rates ────────────────────────────────────────────
-  ax2 = fig_sc.add_subplot(gs[1, :])
-  df_z0 = df[df['zone_id'] == zone_list[0]].set_index('timestamp')
-  # Convert W → kW
-  gas_kw = df_z0['boiler_gas_rate_w'] / 1000
-  fan_kw = df_z0['fan_elec_rate_w'] / 1000
-  ax2.fill_between(
-      df_z0.index,
-      0,
-      gas_kw,
-      alpha=0.6,
-      color='firebrick',
-      label='Boiler gas [kW]',
-  )
-  ax2.fill_between(
-      df_z0.index,
-      gas_kw,
-      gas_kw + fan_kw,
-      alpha=0.6,
-      color='royalblue',
-      label='Fan electricity [kW]',
-  )
-
-  # Shade business hours
-  for day_offset in range(7):
-    day_start = df['timestamp'].min() + pd.Timedelta(day_offset, unit='day')
-    ax2.axvspan(
-        day_start + pd.Timedelta(9, unit='h'),
-        day_start + pd.Timedelta(18, unit='h'),
-        alpha=0.07,
-        color='gold',
-    )
-
-  ax2.set_title(f'{title_prefix} – HVAC Energy Rates', fontsize=12)
-  ax2.set_ylabel('Power [kW]')
-  ax2.legend(fontsize=9, loc='upper right')
-  ax2.grid(True, alpha=0.3)
-
-  # ── Panel 3: Occupancy ────────────────────────────────────────────────────
-  ax3 = fig_sc.add_subplot(gs[2, :])
-  ax3.step(
-      df_z0.index,
-      df_z0['occupancy'],
-      where='post',
-      color='teal',
+# Row 4: Zone supply temperature
+ax = axes_h[4]
+for zid in ZONE_IDS:
+  ax.plot(
+      TS_H,
+      zone_supply_temp_h[zid],
+      color=ZONE_COLORS[zid],
       lw=1.5,
-      label='Avg occupants/zone',
+      label=f"{zid} zone supply",
   )
-  ax3.fill_between(
-      df_z0.index,
-      df_z0['occupancy'],
-      step='post',
-      alpha=0.3,
-      color='teal',
-  )
-  ax3.set_title(f'{title_prefix} – Occupancy', fontsize=12)
-  ax3.set_ylabel('Avg Occupants per Zone')
-  ax3.set_ylim(-0.2, 12)
-  ax3.grid(True, alpha=0.3)
-  ax3.legend(fontsize=9)
-
-  # ── Panel 4: Floor plan heatmaps ──────────────────────────────────────────
-  if heatmap_snapshots is None:
-    sim_start = df['timestamp'].min()
-    heatmap_snapshots = [
-        sim_start + pd.Timedelta(dt, unit='h') for dt in [0, 12, 36, 144]
-    ]
-
-  # Build a lookup: zone_id → list of (row, col) CV indices
-  # Uses get_zone_average_temps() keys only (real rooms)
-  room_dict = {
-      zone_id: bld_final._room_dict[zone_id]  # pylint: disable=protected-access
-      for zone_id in zone_list
-  }
-
-  for idx, snap_ts in enumerate(heatmap_snapshots):
-    ax_hm = fig_sc.add_subplot(gs[3, idx])
-
-    # Find the closest recorded timestamp
-    time_diffs = (df['timestamp'] - snap_ts).abs()
-    closest = df['timestamp'].iloc[time_diffs.argsort().iloc[0]]
-    snap_df = df[df['timestamp'] == closest]
-
-    # Fill temperature grid with zone averages
-    temp_grid = np.full(FLOOR_PLAN.shape, np.nan)
-    for _, row in snap_df.iterrows():
-      if row['zone_id'] in room_dict:
-        for r, c in room_dict[row['zone_id']]:
-          temp_grid[r, c] = row['zone_temp_c']
-
-    air_mask = FLOOR_PLAN == 0
-    vmin = df['zone_temp_c'].min() - 1
-    vmax = df['zone_temp_c'].max() + 1
-
-    air_display = np.ma.masked_where(~air_mask, temp_grid)
-    img = ax_hm.imshow(
-        air_display,
-        cmap='RdBu_r',
-        vmin=vmin,
-        vmax=vmax,
-        origin='upper',
-        aspect='equal',
-    )
-    # Walls overlay
-    wall_display = np.ma.masked_where(FLOOR_PLAN == 0, FLOOR_PLAN.astype(float))
-    ax_hm.imshow(
-        wall_display,
-        cmap=mcolors.ListedColormap(['#cccccc', '#666666']),
-        vmin=0.5,
-        vmax=2.5,
-        origin='upper',
-        aspect='equal',
-        alpha=1.0,
-    )
-
-    plt.colorbar(img, ax=ax_hm, label='°C', fraction=0.046, pad=0.04)
-    dt_hours = (snap_ts - df['timestamp'].min()).total_seconds() / 3600
-    ax_hm.set_title(f't = {dt_hours:.0f} h', fontsize=10)
-    ax_hm.axis('off')
-
-  fig_sc.suptitle(
-      f'{title_prefix} – 7-Day Building Simulation',
-      fontsize=14,
-      y=1.01,
-  )
-  safe_name = (
-      title_prefix.lower().replace(' ', '_').replace('(', '').replace(')', '')
-  )
-  plt.savefig(f'{safe_name}_results.png', dpi=120, bbox_inches='tight')
-  plt.show()
-  print('Figure saved.')
-
-
-# Zone colours
-ZONE_COLORS = {
-    'room_1': 'steelblue',
-    'room_2': 'darkorange',
-}
-
-plot_scenario(
-    df=df_heat,
-    bld_final=bld_heat,
-    title_prefix='Heating Scenario (Winter)',
-    zone_colors=ZONE_COLORS,
-    outdoor_color='navy',
+ax.axhline(
+    HEATING_SETPOINT_K - KELVIN_TO_CELSIUS,
+    color="red",
+    ls=":",
+    lw=1,
+    label="Heating SP",
 )
+ax.set_ylabel("Temp [°C]")
+ax.set_title("VAV Zone Supply Temperature (after reheat coil)")
+ax.legend(fontsize=8, ncol=3)
+ax.grid(True, alpha=0.3)
+
+# Row 5: Heat injected to zone (q_zone)
+ax = axes_h[5]
+for zid in ZONE_IDS:
+  ax.plot(
+      TS_H,
+      q_zone_h[zid],
+      color=ZONE_COLORS[zid],
+      lw=1.5,
+      drawstyle="steps-post",
+      label=f"{zid} q_zone",
+  )
+ax.axhline(0, color="gray", lw=0.8, ls="--")
+ax.set_ylabel("Heat [kW]")
+ax.set_title("VAV Heat Injected to Zone (+heating / −cooling)")
+ax.legend(fontsize=8, ncol=2)
+ax.grid(True, alpha=0.3)
+
+# Row 6: AHU supply air temperature
+ax = axes_h[6]
+ax.plot(TS_H, ahu_supply_h, color="teal", lw=1.5, label="AHU supply air")
+ax.axhline(
+    AHU_HEAT_SP_K - KELVIN_TO_CELSIUS,
+    color="red",
+    ls=":",
+    lw=1,
+    label=f"AHU heat SP ({AHU_HEAT_SP_K - KELVIN_TO_CELSIUS:.0f} °C)",
+)
+ax.set_ylabel("Temp [°C]")
+ax.set_title("Air Handler – Supply Air Temperature")
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.3)
+
+# Row 7: AHU air flow rate
+ax = axes_h[7]
+ax.plot(
+    TS_H,
+    ahu_flow_h,
+    color="teal",
+    lw=1.5,
+    drawstyle="steps-post",
+    label="AHU air flow [m³/s]",
+)
+ax.set_ylabel("Flow [m³/s]")
+ax.set_title("Air Handler – Total Air Flow Rate")
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.3)
+
+# Row 8: Boiler supply water temperature
+ax = axes_h[8]
+ax.plot(
+    TS_H, boiler_sw_h, color="firebrick", lw=1.5, label="Boiler supply water"
+)
+ax.axhline(
+    BOILER_SUPPLY_WATER_SP_K - KELVIN_TO_CELSIUS,
+    color="red",
+    ls="--",
+    lw=1,
+    label=f"Supply SP ({BOILER_SUPPLY_WATER_SP_K - KELVIN_TO_CELSIUS:.0f} °C)",
+)
+ax.set_ylabel("Temp [°C]")
+ax.set_title("Boiler – Supply Water Temperature Sensor")
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.3)
+
+# Row 9: Boiler return water temperature
+ax = axes_h[9]
+ax.plot(TS_H, boiler_rw_h, color="coral", lw=1.5, label="Boiler return water")
+ax.set_ylabel("Temp [°C]")
+ax.set_title("Boiler – Return Water Temperature Sensor")
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.3)
+
+# Row 10: HVAC energy rates
+ax = axes_h[10]
+ax.plot(TS_H, boiler_gas_h, color="firebrick", lw=1.5, label="Boiler gas [kW]")
+ax.plot(
+    TS_H, fan_elec_h, color="royalblue", lw=1.5, label="Fan electricity [kW]"
+)
+ax.axhline(0, color="gray", lw=0.8, ls="--")
+ax.set_ylabel("Power [kW]")
+ax.set_title("HVAC Energy Rates")
+ax.legend(fontsize=8, ncol=2)
+ax.grid(True, alpha=0.3)
+
+# Row 11: Outdoor air temperature
+ax = axes_h[11]
+ax.plot(TS_H, outdoor_h, color="navy", lw=1.2, label="Outdoor temp")
+ax.set_ylabel("Temp [°C]")
+ax.set_xlabel("Timestamp")
+ax.set_title("Outdoor Air Temperature")
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+plt.show()
+print("Heating debug figure complete.")
 
 # %% [markdown]
-# ## Section 9 – Cooling Scenario: 1-Week Summer Simulation
-#
-# **Setup:**
-# * Start time: Monday 2024-07-15 00:00
-# * Initial building temperature: **310 K (37 °C)** – above 295 K cooling SP
-# * Ambient temperature: sinusoidal summer profile, min 295 K (22 °C)
-# * Result: thermostats stay in cooling mode; air handler removes heat
+# ## Section 8 – TFSimulator: Cooling Scenario (3-day)
 
 # %%
-print('=' * 60)
-print('COOLING SCENARIO  – Summer week, building starts at 310 K (37°C)')
-print('=' * 60)
-
-INITIAL_TEMP_COOLING = 310.0  # K – hot building, above cooling setpoint
-START_TS_SUMMER = pd.Timestamp('2024-07-15 00:00:00')  # Monday
+INITIAL_TEMP_COOLING = 310.0
+START_TS_SUMMER = pd.Timestamp("2024-07-15 00:00:00")
 
 bld_cool = create_building(INITIAL_TEMP_COOLING)
-# Use only actual room zones
 hvac_cool = create_hvac(sorted(bld_cool.get_zone_average_temps()))
 
-df_cool = run_simulation(
-    bld=bld_cool,
+sim_cool = tf_simulator_py.TFSimulator(
+    building=bld_cool,
     hvac=hvac_cool,
-    weather_ctrl=wc_summer,
-    occupancy_model=occupancy,
+    weather_controller=wc_summer,
+    time_step_sec=TIME_STEP_SEC,
+    convergence_threshold=0.1,
+    iteration_limit=100,
+    iteration_warning=10,
     start_timestamp=START_TS_SUMMER,
-    n_days=7,
-    time_step_sec=300.0,
-    progress_every=200,
 )
 
-print(f'\nCooling simulation complete. Records: {len(df_cool):,}')
-print(df_cool.head(4).to_string(index=False))
+print(
+    "TFSimulator COOLING init. Mean zone T = "
+    f"{bld_cool.temp.mean() - KELVIN_TO_CELSIUS:.2f} °C"
+)
 
-# %% [markdown]
-# ## Section 10 – Data Collection and Summary (Cooling)
+ts_cool = []
+zone_temp_c = {z: [] for z in ZONE_IDS}
+h_sp_c_list, c_sp_c_list, mode_c = [], [], []
+damper_c = {z: [] for z in ZONE_IDS}
+reheat_v_c = {z: [] for z in ZONE_IDS}
+zone_supply_temp_c = {z: [] for z in ZONE_IDS}
+q_zone_c = {z: [] for z in ZONE_IDS}
+ahu_supply_c = []
+ahu_flow_c = []
+boiler_sw_c = []
+boiler_rw_c = []
+boiler_gas_c = []
+fan_elec_c = []
+outdoor_c = []
 
-# %%
-cool_hourly = (
-    df_cool.set_index('timestamp')
-    .groupby([pd.Grouper(freq='1h'), 'zone_id'])
-    .agg(
-        zone_temp_c=('zone_temp_c', 'mean'),
-        heating_sp_c=('heating_sp_c', 'first'),
-        cooling_sp_c=('cooling_sp_c', 'first'),
-        occupancy=('occupancy', 'mean'),
-        boiler_gas_rate_w=('boiler_gas_rate_w', 'mean'),
-        fan_elec_rate_w=('fan_elec_rate_w', 'mean'),
-        outdoor_temp_c=('outdoor_temp_c', 'mean'),
-        is_comfort_mode=('is_comfort_mode', 'first'),
+for step in range(N_STEPS):
+  ts = sim_cool.current_timestamp
+  outdoor_k = wc_summer.get_current_temp(ts)
+  rec_temp = bld_cool.temp.mean()
+  ahu_supply_k = hvac_cool.air_handler.get_supply_air_temp(rec_temp, outdoor_k)
+
+  ts_cool.append(ts)
+  sched = hvac_cool.vavs[REF_ZONE].thermostat.get_setpoint_schedule()
+  h_sp, c_sp = sched.get_temperature_window(ts)
+  h_sp_c_list.append(h_sp)
+  c_sp_c_list.append(c_sp)
+  # pylint: disable=protected-access
+  mode_c.append(hvac_cool.vavs[REF_ZONE].thermostat._current_mode.value)
+  # pylint: enable=protected-access
+
+  zone_avgs = bld_cool.get_zone_average_temps()
+  for zid in ZONE_IDS:
+    zone_temp_c[zid].append(zone_avgs[zid] - KELVIN_TO_CELSIUS)
+    damper_c[zid].append(hvac_cool.vavs[zid].damper_setting)
+    reheat_v_c[zid].append(hvac_cool.vavs[zid].reheat_valve_setting)
+    zst_k = hvac_cool.vavs[zid].compute_zone_supply_temp(
+        ahu_supply_k, hvac_cool.boiler.reheat_water_setpoint
     )
-    .reset_index()
-)
-
-print('Zone temperature statistics (°C) over entire cooling week:')
-print(df_cool.groupby('zone_id')['zone_temp_c'].describe().round(2).to_string())
-
-# %% [markdown]
-# ## Section 11 – Cooling Scenario Visualisations
-
-# %%
-plot_scenario(
-    df=df_cool,
-    bld_final=bld_cool,
-    title_prefix='Cooling Scenario (Summer)',
-    zone_colors=ZONE_COLORS,
-    outdoor_color='saddlebrown',
-)
-
-# %% [markdown]
-# ## Section 12 – Side-by-Side Comparison and Summary
-#
-# We compare:
-# 1. Zone temperature recovery: how quickly each scenario reaches comfort band
-# 2. Time inside/outside the comfort band during occupied hours
-# 3. Total energy consumed over the week
-
-# %%
-# ── Helper: compute comfort metrics ──────────────────────────────────────────
-
-
-def comfort_metrics(df: pd.DataFrame, scenario_label: str) -> pd.DataFrame:
-  """Compute per-zone comfort and energy metrics for a scenario."""
-  results = []
-  for zone_id in sorted(df['zone_id'].unique()):
-    zone_df = df[df['zone_id'] == zone_id].copy()
-    zone_df['in_comfort'] = (zone_df['zone_temp_k'] >= HEATING_SETPOINT_K) & (
-        zone_df['zone_temp_k'] <= COOLING_SETPOINT_K
+    zone_supply_temp_c[zid].append(zst_k - KELVIN_TO_CELSIUS)
+    q_w = hvac_cool.vavs[zid].compute_energy_applied_to_zone(
+        zone_avgs[zid], ahu_supply_k, hvac_cool.boiler.reheat_water_setpoint
     )
-    occupied = zone_df[zone_df['occupancy'] > 1.0]  # work hours only
-    pct_comfort = occupied['in_comfort'].mean() * 100 if len(occupied) else 0.0
+    q_zone_c[zid].append(q_w / 1000)
 
-    # Total energy [kWh] = power [W] × dt [h] / 1000
-    dt_hours = 300.0 / 3600.0  # 5-min steps → hours
-    total_gas_kwh = zone_df['boiler_gas_rate_w'].sum() * dt_hours / 1000.0
-    total_fan_kwh = zone_df['fan_elec_rate_w'].sum() * dt_hours / 1000.0
+  ahu_supply_c.append(ahu_supply_k - KELVIN_TO_CELSIUS)
+  ahu_flow_c.append(hvac_cool.air_handler.air_flow_rate)
 
-    results.append({
-        'Scenario': scenario_label,
-        'Zone': zone_id,
-        '% Time in Comfort (occupied hrs)': round(pct_comfort, 1),
-        'Min Temp [C]': round(zone_df['zone_temp_c'].min(), 2),
-        'Max Temp [C]': round(zone_df['zone_temp_c'].max(), 2),
-        'Boiler gas [kWh]': round(total_gas_kwh, 1),
-        'Fan electricity [kWh]': round(total_fan_kwh, 2),
-    })
-  return pd.DataFrame(results)
-
-
-metrics_heat = comfort_metrics(df_heat, 'Winter Heating')
-metrics_cool = comfort_metrics(df_cool, 'Summer Cooling')
-metrics_all = pd.concat([metrics_heat, metrics_cool], ignore_index=True)
-
-print('=' * 80)
-print('COMFORT & ENERGY SUMMARY')
-print('=' * 80)
-print(metrics_all.to_string(index=False))
-
-# %%
-# ── Comparison figure ─────────────────────────────────────────────────────────
-fig_cmp, axes_cmp = plt.subplots(2, 2, figsize=(16, 10))
-fig_cmp.suptitle(
-    'Heating vs. Cooling Scenario – Weekly Comparison', fontsize=14
-)
-
-zone_list_cmp = ['room_1', 'room_2']
-
-# ── (0,0) room_1 temperature overlay ─────────────────────────────────────────
-ax = axes_cmp[0, 0]
-for df_, label, style in [
-    (df_heat, 'Winter / Heating', '-'),
-    (df_cool, 'Summer / Cooling', '--'),
-]:
-  dz = df_[df_['zone_id'] == zone_list_cmp[0]].set_index('timestamp')
-  t_h = [(t - dz.index[0]).total_seconds() / 3600 for t in dz.index]
-  ax.plot(
-      t_h,
-      dz['zone_temp_c'],
-      lw=1.3,
-      ls=style,
-      color=ZONE_COLORS[zone_list_cmp[0]],
-      label=label,
-      alpha=0.85,
+  rw_k = hvac_cool.boiler.return_water_temperature_sensor
+  boiler_sw_c.append(
+      hvac_cool.boiler.supply_water_temperature_sensor - KELVIN_TO_CELSIUS
   )
+  boiler_rw_c.append(rw_k - KELVIN_TO_CELSIUS)
+  boiler_gas_c.append(
+      hvac_cool.boiler.compute_thermal_energy_rate(rw_k, outdoor_k) / 1000
+  )
+  fan_elec_c.append(
+      (
+          hvac_cool.air_handler.compute_intake_fan_energy_rate()
+          + hvac_cool.air_handler.compute_exhaust_fan_energy_rate()
+      )
+      / 1000
+  )
+  outdoor_c.append(outdoor_k - KELVIN_TO_CELSIUS)
 
-ax.axhspan(h_sp_c, c_sp_c, alpha=0.15, color='green', label='Comfort band')
-ax.axhline(h_sp_c, color='red', ls=':', lw=1)
-ax.axhline(c_sp_c, color='orange', ls=':', lw=1)
-ax.set_title(f'Zone Temperature – {zone_list_cmp[0]}')
-ax.set_xlabel('Simulation hours')
-ax.set_ylabel('Temperature [°C]')
-ax.legend(fontsize=9)
+  sim_cool.step_sim()
+
+  if (step + 1) % 288 == 0:
+    avg_t = sum(bld_cool.get_zone_average_temps().values()) / len(ZONE_IDS)
+    print(
+        f'  Day {(step+1)//288} | {ts.strftime("%m-%d %H:%M")}'
+        f" | mean T={avg_t - KELVIN_TO_CELSIUS:.2f} °C"
+        f" | outdoor={outdoor_k - KELVIN_TO_CELSIUS:.2f} °C"
+        f" | mode={mode_c[-1]}"
+    )
+
+print("Cooling simulation complete.")
+
+# %% [markdown]
+# ## Section 9 – Cooling Scenario: 12-Row Debug Visualisation
+
+# %%
+TS_C = ts_cool
+fig_c, axes_c = plt.subplots(N_ROWS, 1, figsize=(18, N_ROWS * 3), sharex=True)
+fig_c.suptitle(
+    "Cooling Scenario (Summer) – 3-Day Debug\n"
+    f"(VAV air={VAV_MAX_AIR_FLOW} m³/s, AHU cool SP="
+    f"{AHU_COOL_SP_K - KELVIN_TO_CELSIUS:.0f} °C)",
+    fontsize=13,
+)
+
+ax = axes_c[0]
+for zid in ZONE_IDS:
+  ax.plot(TS_C, zone_temp_c[zid], color=ZONE_COLORS[zid], lw=1.5, label=zid)
+ax.plot(
+    TS_C,
+    [t - KELVIN_TO_CELSIUS for t in h_sp_c_list],
+    color="red",
+    lw=1.2,
+    ls="--",
+    drawstyle="steps-post",
+    label="Heating SP",
+)
+ax.plot(
+    TS_C,
+    [t - KELVIN_TO_CELSIUS for t in c_sp_c_list],
+    color="orange",
+    lw=1.2,
+    ls="--",
+    drawstyle="steps-post",
+    label="Cooling SP",
+)
+ax.set_ylabel("Temp [°C]")
+ax.set_title("Zone Air Temperature vs. Setpoints")
+ax.legend(fontsize=8, ncol=4, loc="upper right")
 ax.grid(True, alpha=0.3)
 
-# ── (0,1) room_2 temperature overlay ─────────────────────────────────────────
-ax = axes_cmp[0, 1]
-for df_, label, style in [
-    (df_heat, 'Winter / Heating', '-'),
-    (df_cool, 'Summer / Cooling', '--'),
-]:
-  dz = df_[df_['zone_id'] == zone_list_cmp[1]].set_index('timestamp')
-  t_h = [(t - dz.index[0]).total_seconds() / 3600 for t in dz.index]
-  ax.plot(
-      t_h,
-      dz['zone_temp_c'],
-      lw=1.3,
-      ls=style,
-      color=ZONE_COLORS[zone_list_cmp[1]],
-      label=label,
-      alpha=0.85,
-  )
-
-ax.axhspan(h_sp_c, c_sp_c, alpha=0.15, color='green', label='Comfort band')
-ax.axhline(h_sp_c, color='red', ls=':', lw=1)
-ax.axhline(c_sp_c, color='orange', ls=':', lw=1)
-ax.set_title(f'Zone Temperature – {zone_list_cmp[1]}')
-ax.set_xlabel('Simulation hours')
-ax.set_ylabel('Temperature [°C]')
-ax.legend(fontsize=9)
+ax = axes_c[1]
+ax.plot(
+    TS_C,
+    mode_c,
+    color="purple",
+    lw=1.5,
+    drawstyle="steps-post",
+    label="Mode (0=OFF,1=HEAT,2=COOL,3=PASSIVE_COOL)",
+)
+ax.set_ylabel("Mode")
+ax.set_yticks([0, 1, 2, 3])
+ax.set_yticklabels(["OFF", "HEAT", "COOL", "P.COOL"])
+ax.set_title("Thermostat Mode")
+ax.legend(fontsize=8)
 ax.grid(True, alpha=0.3)
 
-# ── (1,0) % Time in Comfort Band ─────────────────────────────────────────────
-ax = axes_cmp[1, 0]
-bar_data = metrics_all[
-    ['Scenario', 'Zone', '% Time in Comfort (occupied hrs)']
-].copy()
-pivot_bar = bar_data.pivot(
-    index='Zone',
-    columns='Scenario',
-    values='% Time in Comfort (occupied hrs)',
-)
-x_pos = np.arange(len(pivot_bar.index))
-width = 0.35
-bars_h = ax.bar(
-    x_pos - width / 2,
-    pivot_bar['Winter Heating'],
-    width,
-    label='Winter Heating',
-    color='steelblue',
-    alpha=0.8,
-)
-bars_c = ax.bar(
-    x_pos + width / 2,
-    pivot_bar['Summer Cooling'],
-    width,
-    label='Summer Cooling',
-    color='darkorange',
-    alpha=0.8,
-)
-ax.set_xticks(x_pos)
-ax.set_xticklabels(pivot_bar.index)
-ax.set_ylim(0, 110)
-ax.set_ylabel('% Time in Comfort Band')
-ax.set_title('Comfort Compliance (Occupied Hours Only)')
-ax.legend(fontsize=9)
-ax.grid(True, axis='y', alpha=0.3)
-for bar_obj, val in zip(bars_h, pivot_bar['Winter Heating']):
-  ax.text(
-      bar_obj.get_x() + bar_obj.get_width() / 2,
-      val + 1,
-      f'{val:.1f}%',
-      ha='center',
-      va='bottom',
-      fontsize=9,
+ax = axes_c[2]
+for zid in ZONE_IDS:
+  ax.plot(
+      TS_C,
+      damper_c[zid],
+      color=ZONE_COLORS[zid],
+      lw=1.2,
+      drawstyle="steps-post",
+      label=f"{zid} damper",
   )
-for bar_obj, val in zip(bars_c, pivot_bar['Summer Cooling']):
-  ax.text(
-      bar_obj.get_x() + bar_obj.get_width() / 2,
-      val + 1,
-      f'{val:.1f}%',
-      ha='center',
-      va='bottom',
-      fontsize=9,
+ax.set_ylabel("Damper [0-1]")
+ax.set_ylim(-0.05, 1.05)
+ax.set_title("VAV Damper Position")
+ax.legend(fontsize=8, ncol=2)
+ax.grid(True, alpha=0.3)
+
+ax = axes_c[3]
+for zid in ZONE_IDS:
+  ax.plot(
+      TS_C,
+      reheat_v_c[zid],
+      color=ZONE_COLORS[zid],
+      lw=1.2,
+      drawstyle="steps-post",
+      label=f"{zid} reheat valve",
   )
+ax.set_ylabel("Reheat Valve [0-1]")
+ax.set_ylim(-0.05, 1.05)
+ax.set_title("VAV Reheat Valve Position")
+ax.legend(fontsize=8, ncol=2)
+ax.grid(True, alpha=0.3)
 
-# ── (1,1) Energy breakdown ────────────────────────────────────────────────────
-ax = axes_cmp[1, 1]
-energy_pivot = metrics_all.groupby('Scenario')[
-    ['Boiler gas [kWh]', 'Fan electricity [kWh]']
-].sum()
-
-scenarios = energy_pivot.index.tolist()
-gas_vals = energy_pivot['Boiler gas [kWh]'].values
-fan_vals = energy_pivot['Fan electricity [kWh]'].values
-x_e = np.arange(len(scenarios))
-ax.bar(x_e, gas_vals, label='Boiler gas [kWh]', color='firebrick', alpha=0.8)
-ax.bar(
-    x_e,
-    fan_vals,
-    bottom=gas_vals,
-    label='Fan electricity [kWh]',
-    color='royalblue',
-    alpha=0.8,
+ax = axes_c[4]
+for zid in ZONE_IDS:
+  ax.plot(
+      TS_C,
+      zone_supply_temp_c[zid],
+      color=ZONE_COLORS[zid],
+      lw=1.5,
+      label=f"{zid} zone supply",
+  )
+ax.axhline(
+    COOLING_SETPOINT_K - KELVIN_TO_CELSIUS,
+    color="orange",
+    ls=":",
+    lw=1,
+    label="Cooling SP",
 )
-ax.set_xticks(x_e)
-ax.set_xticklabels(scenarios)
-ax.set_ylabel('Total Energy [kWh]')
-ax.set_title('Total HVAC Energy – 7-Day Scenario')
-ax.legend(fontsize=9)
-ax.grid(True, axis='y', alpha=0.3)
-for xi, (gv, fv) in enumerate(zip(gas_vals, fan_vals)):
-  ax.text(
-      xi,
-      gv + fv + 5,
-      f'{gv + fv:.0f} kWh',
-      ha='center',
-      va='bottom',
-      fontsize=9,
-  )
+ax.set_ylabel("Temp [°C]")
+ax.set_title("VAV Zone Supply Temperature (after reheat coil)")
+ax.legend(fontsize=8, ncol=3)
+ax.grid(True, alpha=0.3)
 
-plt.tight_layout()
-plt.savefig('scenario_comparison.png', dpi=120, bbox_inches='tight')
+ax = axes_c[5]
+for zid in ZONE_IDS:
+  ax.plot(
+      TS_C,
+      q_zone_c[zid],
+      color=ZONE_COLORS[zid],
+      lw=1.5,
+      drawstyle="steps-post",
+      label=f"{zid} q_zone",
+  )
+ax.axhline(0, color="gray", lw=0.8, ls="--")
+ax.set_ylabel("Heat [kW]")
+ax.set_title("VAV Heat Injected to Zone (negative = cooling)")
+ax.legend(fontsize=8, ncol=2)
+ax.grid(True, alpha=0.3)
+
+ax = axes_c[6]
+ax.plot(TS_C, ahu_supply_c, color="teal", lw=1.5, label="AHU supply air")
+ax.axhline(
+    AHU_COOL_SP_K - KELVIN_TO_CELSIUS,
+    color="orange",
+    ls=":",
+    lw=1,
+    label=f"AHU cool SP ({AHU_COOL_SP_K - KELVIN_TO_CELSIUS:.0f} °C)",
+)
+ax.set_ylabel("Temp [°C]")
+ax.set_title("Air Handler – Supply Air Temperature")
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.3)
+
+ax = axes_c[7]
+ax.plot(
+    TS_C,
+    ahu_flow_c,
+    color="teal",
+    lw=1.5,
+    drawstyle="steps-post",
+    label="AHU air flow [m³/s]",
+)
+ax.set_ylabel("Flow [m³/s]")
+ax.set_title("Air Handler – Total Air Flow Rate")
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.3)
+
+ax = axes_c[8]
+ax.plot(
+    TS_C, boiler_sw_c, color="firebrick", lw=1.5, label="Boiler supply water"
+)
+ax.axhline(
+    BOILER_SUPPLY_WATER_SP_K - KELVIN_TO_CELSIUS,
+    color="red",
+    ls="--",
+    lw=1,
+    label=f"Supply SP ({BOILER_SUPPLY_WATER_SP_K - KELVIN_TO_CELSIUS:.0f} °C)",
+)
+ax.set_ylabel("Temp [°C]")
+ax.set_title("Boiler – Supply Water Temperature Sensor")
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.3)
+
+ax = axes_c[9]
+ax.plot(TS_C, boiler_rw_c, color="coral", lw=1.5, label="Boiler return water")
+ax.set_ylabel("Temp [°C]")
+ax.set_title("Boiler – Return Water Temperature Sensor")
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.3)
+
+ax = axes_c[10]
+ax.plot(TS_C, boiler_gas_c, color="firebrick", lw=1.5, label="Boiler gas [kW]")
+ax.plot(
+    TS_C, fan_elec_c, color="royalblue", lw=1.5, label="Fan electricity [kW]"
+)
+ax.axhline(0, color="gray", lw=0.8, ls="--")
+ax.set_ylabel("Power [kW]")
+ax.set_title("HVAC Energy Rates")
+ax.legend(fontsize=8, ncol=2)
+ax.grid(True, alpha=0.3)
+
+ax = axes_c[11]
+ax.plot(TS_C, outdoor_c, color="saddlebrown", lw=1.2, label="Outdoor temp")
+ax.set_ylabel("Temp [°C]")
+ax.set_xlabel("Timestamp")
+ax.set_title("Outdoor Air Temperature")
+ax.legend(fontsize=8)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout(rect=[0, 0, 1, 0.97])
 plt.show()
-print('Comparison figure saved to scenario_comparison.png')
+print("Cooling debug figure complete.")
 
 # %% [markdown]
-# ## Summary
-#
-# | Metric | Winter Heating | Summer Cooling |
-# |--------|---------------|----------------|
-# | Initial temp | 275 K (2 °C) | 310 K (37 °C) |
-# | Outdoor range | −5 °C to 4 °C | 22 °C to 35 °C |
-# | HVAC action | Boiler heats water → VAVs inject heat | AirHandler cools air |
-# | Primary energy | Natural gas (boiler) | Electricity (fan) |
-# | Control trigger | zone_temp < 292 K → heating ON |
-# |                 | zone_temp > 295 K → cooling ON |
-# | Setback schedule | 290–297 K outside 9am–6pm | same |
-#
-# ### Key observations
-# 1. **Heating scenario**: the boiler immediately activates because zone
-#    temperatures are below the 292 K heating setpoint.  The building warms
-#    steadily; corner cells respond faster due to greater convective exposure.
-# 2. **Cooling scenario**: the air handler activates immediately because zone
-#    temperatures exceed 295 K.  During cool nights the outdoor temperature
-#    drops toward the comfort band, giving partial free cooling.
-# 3. **Setpoint schedule**: during working hours (9am–6pm) the comfort band
-#    (292–295 K) is active; outside those hours the wider eco band (290–297 K)
-#    reduces HVAC energy demand.
-# 4. **Zone differences**: room_1 and room_2 show slightly different
-#    temperature trajectories due to diffuser placement and distance from
-#    exterior walls.
+# ## Section 10 – Scenario Comparison (4-row overlay)
+
 
 # %%
-print('Notebook complete.')
-print('Figures produced:')
-for fname in [
-    'floor_plan.png',
-    'weather_profiles.png',
-    'occupancy_profile.png',
-    'heating_scenario_winter_results.png',
-    'cooling_scenario_summer_results.png',
-    'scenario_comparison.png',
-]:
-  exists = os.path.exists(fname)
-  print(f"  {'OK' if exists else '--'} {fname}")
+def to_hours(ts_list, t0):
+  return [(t - t0).total_seconds() / 3600 for t in ts_list]
+
+
+hours_h = to_hours(ts_heat, ts_heat[0])
+hours_c = to_hours(ts_cool, ts_cool[0])
+
+fig_cmp, axes_cmp = plt.subplots(4, 1, figsize=(16, 16), sharex=True)
+fig_cmp.suptitle(
+    f"Heating vs. Cooling – Overlaid (0–{N_DAYS*24} h)", fontsize=13
+)
+
+ax = axes_cmp[0]
+for zid in ZONE_IDS:
+  ax.plot(
+      hours_h,
+      zone_temp_h[zid],
+      color=ZONE_COLORS[zid],
+      lw=1.5,
+      ls="-",
+      label=f"{zid} (heat)",
+  )
+  ax.plot(
+      hours_c,
+      zone_temp_c[zid],
+      color=ZONE_COLORS[zid],
+      lw=1.5,
+      ls="--",
+      label=f"{zid} (cool)",
+  )
+ax.axhline(h_sp_c, color="red", ls=":", lw=1, label=f"HeatSP {h_sp_c:.0f} °C")
+ax.axhline(
+    c_sp_c, color="orange", ls=":", lw=1, label=f"CoolSP {c_sp_c:.0f} °C"
+)
+ax.set_ylabel("Temp [°C]")
+ax.set_title("Zone Air Temperatures")
+ax.legend(fontsize=8, ncol=3)
+ax.grid(True, alpha=0.3)
+
+ax = axes_cmp[1]
+for zid in ZONE_IDS:
+  ax.plot(
+      hours_h,
+      zone_supply_temp_h[zid],
+      color=ZONE_COLORS[zid],
+      lw=1.5,
+      ls="-",
+      label=f"{zid} supply (heat)",
+  )
+  ax.plot(
+      hours_c,
+      zone_supply_temp_c[zid],
+      color=ZONE_COLORS[zid],
+      lw=1.5,
+      ls="--",
+      label=f"{zid} supply (cool)",
+  )
+ax.set_ylabel("Temp [°C]")
+ax.set_title("VAV Zone Supply Temperature")
+ax.legend(fontsize=8, ncol=2)
+ax.grid(True, alpha=0.3)
+
+ax = axes_cmp[2]
+for zid in ZONE_IDS:
+  ax.plot(
+      hours_h,
+      q_zone_h[zid],
+      color=ZONE_COLORS[zid],
+      lw=1.5,
+      ls="-",
+      drawstyle="steps-post",
+      label=f"{zid} q (heat)",
+  )
+  ax.plot(
+      hours_c,
+      q_zone_c[zid],
+      color=ZONE_COLORS[zid],
+      lw=1.5,
+      ls="--",
+      drawstyle="steps-post",
+      label=f"{zid} q (cool)",
+  )
+ax.axhline(0, color="gray", lw=0.8, ls="--")
+ax.set_ylabel("Heat [kW]")
+ax.set_title("Heat Injected to Zone")
+ax.legend(fontsize=8, ncol=2)
+ax.grid(True, alpha=0.3)
+
+ax = axes_cmp[3]
+ax.plot(
+    hours_h,
+    boiler_gas_h,
+    color="firebrick",
+    lw=1.5,
+    label="Boiler gas (heat) [kW]",
+)
+ax.plot(
+    hours_c,
+    boiler_gas_c,
+    color="firebrick",
+    lw=1.5,
+    ls="--",
+    label="Boiler gas (cool) [kW]",
+)
+ax.plot(
+    hours_h,
+    fan_elec_h,
+    color="royalblue",
+    lw=1.5,
+    label="Fan elec (heat) [kW]",
+)
+ax.plot(
+    hours_c,
+    fan_elec_c,
+    color="royalblue",
+    lw=1.5,
+    ls="--",
+    label="Fan elec (cool) [kW]",
+)
+ax.set_ylabel("Power [kW]")
+ax.set_xlabel("Hours from start")
+ax.set_title("HVAC Energy Rates")
+ax.legend(fontsize=8, ncol=2)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+plt.show()
+print("Comparison figure complete.")
+
+# %% [markdown]
+# ## Section 11 – Summary
+
+# %%
+DT_H = TIME_STEP_SEC / 3600
+
+
+def scenario_summary(
+    scenario_label, zone_temps_c, h_sp_k_list, c_sp_k_list, gas_list, fan_list
+):
+  """Return a dict of summary metrics."""
+  all_temps = []
+  for zone_key in ZONE_IDS:
+    all_temps.extend(zone_temps_c[zone_key])
+  total_gas_kwh = sum(gas_list) * DT_H
+  total_fan_kwh = sum(fan_list) * DT_H
+  in_comfort = [
+      (zone_temps_c[zid][i] >= h_sp_k_list[i] - KELVIN_TO_CELSIUS)
+      and (zone_temps_c[zid][i] <= c_sp_k_list[i] - KELVIN_TO_CELSIUS)
+      for i in range(len(h_sp_k_list))
+      for zid in ZONE_IDS
+  ]
+  return {
+      "Scenario": scenario_label,
+      "Min zone temp [C]": round(min(all_temps), 2),
+      "Max zone temp [C]": round(max(all_temps), 2),
+      "% Time in comfort": round(sum(in_comfort) / len(in_comfort) * 100, 1),
+      "Boiler gas [kWh]": round(total_gas_kwh, 1),
+      "Fan elec [kWh]": round(total_fan_kwh, 2),
+      "Total HVAC [kWh]": round(total_gas_kwh + total_fan_kwh, 1),
+  }
+
+
+smry_h = scenario_summary(
+    "Winter Heating", zone_temp_h, h_sp_h, c_sp_h, boiler_gas_h, fan_elec_h
+)
+smry_c = scenario_summary(
+    "Summer Cooling",
+    zone_temp_c,
+    h_sp_c_list,
+    c_sp_c_list,
+    boiler_gas_c,
+    fan_elec_c,
+)
+
+smry_df = pd.DataFrame([smry_h, smry_c]).set_index("Scenario")
+print("=" * 65)
+print("SIMULATION SUMMARY")
+print("=" * 65)
+print(smry_df.to_string())
+print()
+print("Notebook complete.")
