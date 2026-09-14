@@ -444,6 +444,213 @@ def get_oriented_conductivity_tensors(
   return t_k_left_edge, t_k_right_edge, t_k_top_edge, t_k_bottom_edge
 
 
+def get_half_cell_resistance_tensors(
+    conductivity: np.ndarray,
+    t_u: tf.Tensor,
+    t_v: tf.Tensor,
+) -> tuple[tf.Tensor, tf.Tensor]:
+  r"""Returns the half-cell conduction resistances of every CV.
+
+  Half of a CV lies between its node and each of its faces, so the conduction
+  resistance per unit area from the node to a face normal to u is
+
+  $$\frac{u_P}{2k_P},$$
+
+  and to a face normal to v it is $v_P / (2k_P)$.
+
+  Args:
+    conductivity: conductivity of each CV, $\mathrm{W/(m \cdot K)}$.
+    t_u: horizontal CV dimension tensor, $\mathrm{m}$.
+    t_v: vertical CV dimension tensor, $\mathrm{m}$.
+
+  Returns:
+    Half-cell resistance tensors toward the u-normal and the v-normal faces,
+    $\mathrm{m^2 \cdot K/W}$.
+  """
+  t_conductivity = tf.convert_to_tensor(conductivity, dtype=tf.float32)
+  t_two_k = tf.scalar_mul(tf.constant(2.0, dtype=tf.float32), t_conductivity)
+  return tf.math.divide(t_u, t_two_k), tf.math.divide(t_v, t_two_k)
+
+
+def get_oriented_face_conductance_tensors(
+    conductivity: np.ndarray,
+    t_u: tf.Tensor,
+    t_v: tf.Tensor,
+    boundary_cv_mapping: BoundaryCVMapping,
+) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+  r"""Returns the interior face conductances per unit area.
+
+  An interior face is shared by two CVs, so the heat crossing it has to pass
+  through both half cells in series:
+
+  $$\Gamma_f = \left[\frac{\ell_{P,f}}{2k_P} +
+      \frac{\ell_{N_f,f}}{2k_{N_f}}\right]^{-1}$$
+
+  with $\ell_{P,1} = \ell_{P,3} = u_P$ and $\ell_{P,2} = \ell_{P,4} = v_P$.
+
+  Taking the owner CV's own conductivity across its own full width instead,
+  i.e. $k_P / \ell_{P,f}$, makes the two CVs sharing a face disagree about the
+  heat crossing it, so the balance is not conservative wherever materials
+  differ - inside air next to an exterior wall is off by the ratio of their
+  conductivities. For a uniform material on a uniform grid both forms agree.
+
+  The balance multiplies these by the owner CV's own face area, so where a
+  half-width boundary CV meets a full-width neighbor the two would claim
+  different areas of contact. The conductance returned here is scaled by the
+  ratio of the shared width to the owner's width so that the product is the
+  same seen from either side.
+
+  Faces that open onto the ambient are excluded here: they carry a convective
+  film and are handled by get_oriented_ambient_conductance_tensors.
+
+  Args:
+    conductivity: conductivity of each CV, $\mathrm{W/(m \cdot K)}$.
+    t_u: horizontal CV dimension tensor, $\mathrm{m}$.
+    t_v: vertical CV dimension tensor, $\mathrm{m}$.
+    boundary_cv_mapping: dict of boundary CVs.
+
+  Returns:
+    Face conductance tensors for the left, right, top and bottom faces,
+    $\mathrm{W/(m^2 \cdot K)}$, zero on faces that open onto the ambient.
+  """
+
+  (
+      t_k_left_edge,
+      t_k_right_edge,
+      t_k_top_edge,
+      t_k_bottom_edge,
+  ) = get_oriented_conductivity_tensors(conductivity, boundary_cv_mapping)
+
+  t_r_u, t_r_v = get_half_cell_resistance_tensors(conductivity, t_u, t_v)
+
+  def _series_conductance(
+      t_r_own: tf.Tensor,
+      t_r_neighbor: tf.Tensor,
+      t_w_own: tf.Tensor,
+      t_w_neighbor: tf.Tensor,
+      t_k_edge: tf.Tensor,
+  ) -> tf.Tensor:
+    """Inverts the two half-cell resistances in series on the active faces."""
+    t_conductance = tf.math.divide(
+        tf.constant(1.0, dtype=tf.float32),
+        tf.math.add(t_r_own, t_r_neighbor),
+    )
+    # The balance multiplies this by the owner's own face area, but a boundary
+    # CV is only half as wide as a full CV across the face, so the two CVs
+    # sharing the face would otherwise disagree about the area of contact. The
+    # shared area is the narrower of the two, so scale the owner's conductance
+    # by that ratio to make the exchange conservative.
+    t_conductance = tf.math.multiply(
+        t_conductance,
+        tf.math.divide(tf.math.minimum(t_w_own, t_w_neighbor), t_w_own),
+    )
+    # t_k_edge is zero exactly on the faces that open onto the ambient, which
+    # is also where the shifted neighbor resistance is padding rather than a
+    # real neighbor.
+    return tf.where(
+        tf.math.not_equal(t_k_edge, 0.0),
+        t_conductance,
+        tf.zeros_like(t_conductance),
+    )
+
+  return (
+      _series_conductance(
+          t_r_u,
+          shift_tensor_right(t_r_u),
+          t_v,
+          shift_tensor_right(t_v),
+          t_k_left_edge,
+      ),
+      _series_conductance(
+          t_r_u,
+          shift_tensor_left(t_r_u),
+          t_v,
+          shift_tensor_left(t_v),
+          t_k_right_edge,
+      ),
+      _series_conductance(
+          t_r_v,
+          shift_tensor_down(t_r_v),
+          t_u,
+          shift_tensor_down(t_u),
+          t_k_top_edge,
+      ),
+      _series_conductance(
+          t_r_v,
+          shift_tensor_up(t_r_v),
+          t_u,
+          shift_tensor_up(t_u),
+          t_k_bottom_edge,
+      ),
+  )
+
+
+def get_oriented_ambient_conductance_tensors(
+    convection_coefficient_air: float,
+    conductivity: np.ndarray,
+    t_u: tf.Tensor,
+    t_v: tf.Tensor,
+    boundary_cv_mapping: BoundaryCVMapping,
+) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+  r"""Returns the exterior boundary face conductances per unit area.
+
+  On a face that opens onto the ambient the heat passes through the outer half
+  of the boundary CV and then through the convective film, in series:
+
+  $$\Gamma_{\infty,f} = \left[\frac{1}{h_{ext}} +
+      \frac{\ell_{P,f}}{2k_P}\right]^{-1}$$
+
+  Using $h_{ext}$ on its own drops the conduction resistance of that outer
+  half cell, which overstates the exchange with the ambient - badly so for an
+  insulating exterior wall, where the half-cell resistance dominates the film.
+
+  $h_{ext}$ is used only on exterior boundary faces; interior faces are pure
+  conduction through neighboring half cells.
+
+  Args:
+    convection_coefficient_air: outside air convection coefficient,
+      $\mathrm{W/(m^2 \cdot K)}$.
+    conductivity: conductivity of each CV, $\mathrm{W/(m \cdot K)}$.
+    t_u: horizontal CV dimension tensor, $\mathrm{m}$.
+    t_v: vertical CV dimension tensor, $\mathrm{m}$.
+    boundary_cv_mapping: dict of boundary CVs.
+
+  Returns:
+    Ambient conductance tensors for the left, right, top and bottom faces,
+    $\mathrm{W/(m^2 \cdot K)}$, zero on faces that do not touch the ambient.
+  """
+
+  (
+      t_h_left_edge,
+      t_h_right_edge,
+      t_h_top_edge,
+      t_h_bottom_edge,
+  ) = get_oriented_convection_coefficient_tensors(
+      convection_coefficient_air, conductivity.shape, boundary_cv_mapping
+  )
+
+  t_r_u, t_r_v = get_half_cell_resistance_tensors(conductivity, t_u, t_v)
+
+  def _film_and_half_cell(t_h_edge: tf.Tensor, t_r_own: tf.Tensor) -> tf.Tensor:
+    """Inverts the film and half-cell resistances in series on active faces."""
+    t_one = tf.constant(1.0, dtype=tf.float32)
+    t_active = tf.math.greater(t_h_edge, 0.0)
+    # Keep the reciprocal finite on the inactive faces, which are masked out
+    # right after.
+    t_h_safe = tf.where(t_active, t_h_edge, tf.ones_like(t_h_edge))
+    t_conductance = tf.math.divide(
+        t_one, tf.math.add(tf.math.divide(t_one, t_h_safe), t_r_own)
+    )
+    return tf.where(t_active, t_conductance, tf.zeros_like(t_conductance))
+
+  return (
+      _film_and_half_cell(t_h_left_edge, t_r_u),
+      _film_and_half_cell(t_h_right_edge, t_r_u),
+      _film_and_half_cell(t_h_top_edge, t_r_v),
+      _film_and_half_cell(t_h_bottom_edge, t_r_v),
+  )
+
+
 def shift_tensor_right(
     x: tf.Tensor,
     padding_value: float = 0,
@@ -549,6 +756,24 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
     ) = get_oriented_conductivity_tensors(
         self.building.conductivity, self._boundary_cv_mapping
     )
+
+    # An interior face is shared by two CVs, so its conductance comes from the
+    # two half-cell resistances in series rather than from the owner CV's
+    # conductivity alone. These are geometry and material only, so they are
+    # built once here; the ambient faces additionally depend on the wind film
+    # coefficient and are rebuilt every step.
+    (
+        self._t_face_conductance_left,
+        self._t_face_conductance_right,
+        self._t_face_conductance_top,
+        self._t_face_conductance_bottom,
+    ) = get_oriented_face_conductance_tensors(
+        self.building.conductivity,
+        self._t_u,
+        self._t_v,
+        self._boundary_cv_mapping,
+    )
+
     # radiative heat transfer addition
     self.include_radiative_heat_transfer = (
         building.include_radiative_heat_transfer
@@ -701,6 +926,278 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
     # Return as numpy arrays
     return t_temp_mass_new.numpy(), max_delta
 
+  def _get_input_tensors(
+      self,
+      building,
+      temperature_estimates: np.ndarray,
+  ) -> tuple[
+      tf.Tensor,
+      tf.Tensor,
+      tf.Tensor,
+      tf.Tensor,
+      tf.Tensor,
+      tf.Tensor,
+      tf.Tensor,
+      tf.Tensor,
+      tf.Tensor,
+      tf.Tensor,
+  ]:
+    """Returns the input matrices as tensors."""
+    # Convert a bunch of numpy arrays into TF tensors.
+    t_temp = tf.convert_to_tensor(temperature_estimates, dtype=tf.float32)
+    t_temp_old = tf.convert_to_tensor(temperature_estimates, dtype=tf.float32)
+    t_temp_minus = tf.convert_to_tensor(building.temp, dtype=tf.float32)
+    t_input_q = tf.convert_to_tensor(building.input_q, dtype=tf.float32)
+    t_density = tf.convert_to_tensor(building.density, dtype=tf.float32)
+    t_heat_capacity = tf.convert_to_tensor(
+        building.heat_capacity, dtype=tf.float32
+    )
+    t_z = tf.constant(building.floor_height_cm / 100.0, dtype=tf.float32)
+    if self.include_radiative_heat_transfer:
+      t_ifa_inv = tf.convert_to_tensor(building.ifa_inv, dtype=tf.float32)
+      # For radiative heat transfer, we need to combine interior wall and
+      # interior mass temperatures if interior mass is enabled
+      if self.include_interior_mass:
+        interior_mask_all = (
+            building.interior_wall_mask | building.interior_mass_mask
+        )
+        temperature_estimates_temp = np.zeros_like(temperature_estimates)
+        temperature_estimates_temp[building.interior_mass_mask] = (
+            building.interior_mass_temp[building.interior_mass_mask]
+        )
+        temperature_estimates_temp[building.interior_wall_mask] = (
+            temperature_estimates[building.interior_wall_mask]
+        )
+        t_temp_interior_wall = tf.convert_to_tensor(
+            temperature_estimates_temp[interior_mask_all], dtype=tf.float32
+        )
+      else:
+        t_temp_interior_wall = tf.convert_to_tensor(
+            temperature_estimates[building.interior_wall_mask],
+            dtype=tf.float32,
+        )
+      # Ensure t_temp_interior_wall is a column vector for matrix
+      # multiplication
+      t_temp_interior_wall = tf.reshape(t_temp_interior_wall, [-1, 1])
+    else:
+      # Create minimal zero tensors with appropriate shapes
+      # These won't be used when radiative heat transfer is disabled
+      t_ifa_inv = tf.zeros((1, 1), dtype=tf.float32)  # Minimal shape
+      t_temp_interior_wall = tf.zeros((1,), dtype=tf.float32)  # Minimal shape
+
+    # Interior mass temperature tensor
+    if self.include_interior_mass:
+      t_temp_mass = tf.convert_to_tensor(
+          building.interior_mass_temp, dtype=tf.float32
+      )
+    else:
+      t_temp_mass = tf.zeros((1, 1), dtype=tf.float32)  # Minimal shape
+
+    return (
+        t_temp,
+        t_temp_old,
+        t_temp_minus,
+        t_input_q,
+        t_density,
+        t_heat_capacity,
+        t_z,
+        t_ifa_inv,
+        t_temp_interior_wall,
+        t_temp_mass,
+    )
+
+  def _get_neighbor_temps(
+      self, t_temp: tf.Tensor, ambient_temperature: float
+  ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+    """Creates left, right, up, down neighbor temp matrices."""
+
+    # Create shifted tensor to be able to evaluate neighbors in the equation.
+    t_temp_right = shift_tensor_left(t_temp, padding_value=ambient_temperature)
+
+    t_temp_left = shift_tensor_right(t_temp, padding_value=ambient_temperature)
+
+    t_temp_above = shift_tensor_down(t_temp, padding_value=ambient_temperature)
+
+    t_temp_below = shift_tensor_up(t_temp, padding_value=ambient_temperature)
+
+    return (t_temp_left, t_temp_right, t_temp_above, t_temp_below)
+
+  def _get_denominator(
+      self,
+      t_gamma_left: tf.Tensor,
+      t_gamma_right: tf.Tensor,
+      t_gamma_ambient_left: tf.Tensor,
+      t_gamma_ambient_right: tf.Tensor,
+      t_gamma_ambient_top: tf.Tensor,
+      t_gamma_ambient_bottom: tf.Tensor,
+      t_vz: tf.Tensor,
+      t_gamma_bottom: tf.Tensor,
+      t_gamma_top: tf.Tensor,
+      t_uz: tf.Tensor,
+      t_density: tf.Tensor,
+      t_heat_capacity: tf.Tensor,
+      t_z: tf.Tensor,
+      t_delta_t: tf.Tensor,
+  ) -> tf.Tensor:
+    """Returns the denominator matrix from Eqn 22 as a tensor."""
+
+    # Compute conductivity/conduction transfer terms on the v-z surface.
+    dt1 = tf.math.add(t_gamma_left, t_gamma_right)
+    dt1 = tf.math.add(dt1, t_gamma_ambient_left)
+    dt1 = tf.math.add(dt1, t_gamma_ambient_right)
+    dt1 = tf.math.multiply(t_vz, dt1)
+
+    # Compute conductivity/conduction transfer terms on the u-z surface.
+    dt2 = tf.math.add(t_gamma_bottom, t_gamma_top)
+    dt2 = tf.math.add(dt2, t_gamma_ambient_bottom)
+    dt2 = tf.math.add(dt2, t_gamma_ambient_top)
+    dt2 = tf.math.multiply(t_uz, dt2)
+
+    # Create the thermal absorption (storage) term: C * rho * U * V * z / dt.
+    dt3 = tf.math.multiply(t_density, self._t_u)
+    dt3 = tf.math.multiply(dt3, self._t_v)
+    dt3 = tf.math.multiply(dt3, t_heat_capacity)
+    dt3 = tf.scalar_mul(t_z, dt3)
+    dt3 = tf.math.divide(dt3, t_delta_t)
+
+    # Add interior mass coupling term: K_mass * U * V / Z
+    dt4 = tf.zeros_like(dt3)
+    if self.include_interior_mass:
+      dt4 = tf.math.multiply(self._t_interior_mass_conductivity, self._t_u)
+      dt4 = tf.math.multiply(dt4, self._t_v)
+      dt4 = tf.math.divide(dt4, t_z)
+
+    # Sum up u-z, u-v surface transfer, absorption, and interior mass terms.
+    t_denom = tf.math.add(dt1, dt2)
+    t_denom = tf.math.add(t_denom, dt3)
+    t_denom = tf.math.add(t_denom, dt4)
+    return t_denom
+
+  def _get_numerator(
+      self,
+      t_gamma_left: tf.Tensor,
+      t_gamma_right: tf.Tensor,
+      t_gamma_ambient_left: tf.Tensor,
+      t_gamma_ambient_right: tf.Tensor,
+      t_gamma_ambient_top: tf.Tensor,
+      t_gamma_ambient_bottom: tf.Tensor,
+      t_vz: tf.Tensor,
+      t_gamma_bottom: tf.Tensor,
+      t_gamma_top: tf.Tensor,
+      t_uz: tf.Tensor,
+      t_density: tf.Tensor,
+      t_heat_capacity: tf.Tensor,
+      t_z: tf.Tensor,
+      t_delta_t: tf.Tensor,
+      t_temp_left: tf.Tensor,
+      t_temp_right: tf.Tensor,
+      t_temp_above: tf.Tensor,
+      t_temp_below: tf.Tensor,
+      t_temp_inf: tf.Tensor,
+      t_input_q: tf.Tensor,
+      t_temp_minus: tf.Tensor,
+      t_ifa_inv: tf.Tensor,
+      t_temp_interior_wall: tf.Tensor,
+      t_temp_mass: tf.Tensor,
+  ) -> tf.Tensor:
+    """Returns the numerator matrix from Eqn 22 as a tensor."""
+
+    # Compute numerator's conductivity transfer terms.
+    t_gamma_left_temp_left = tf.math.multiply(t_gamma_left, t_temp_left)
+    t_gamma_right_temp_right = tf.math.multiply(t_gamma_right, t_temp_right)
+    t_gamma_bottom_temp_below = tf.math.multiply(t_gamma_bottom, t_temp_below)
+    t_gamma_top_temp_above = tf.math.multiply(t_gamma_top, t_temp_above)
+
+    # Compute numerator's convection transfer terms.
+    t_h_left_tinf = tf.math.scalar_mul(t_temp_inf, t_gamma_ambient_left)
+    t_h_right_tinf = tf.math.scalar_mul(t_temp_inf, t_gamma_ambient_right)
+    t_h_above_tinf = tf.math.scalar_mul(t_temp_inf, t_gamma_ambient_top)
+    t_h_below_tinf = tf.math.scalar_mul(t_temp_inf, t_gamma_ambient_bottom)
+
+    # Merge the conduction/convection transfer terms across the v-z surfaces.
+    nt1 = tf.math.add(t_gamma_left_temp_left, t_gamma_right_temp_right)
+    nt1 = tf.math.add(nt1, t_h_left_tinf)
+    nt1 = tf.math.add(nt1, t_h_right_tinf)
+    nt1 = tf.math.multiply(t_vz, nt1)
+
+    # Merge the conduction/convection transfer terms across the u-z surfaces.
+    nt2 = tf.math.add(t_gamma_bottom_temp_below, t_gamma_top_temp_above)
+    nt2 = tf.math.add(nt2, t_h_below_tinf)
+    nt2 = tf.math.add(nt2, t_h_above_tinf)
+    nt2 = tf.math.multiply(t_uz, nt2)
+
+    # Create the thermal absorption (storage) term:
+    # C * rho * U * V * z / dt * T^(-).
+    nt3 = tf.math.multiply(t_density, self._t_u)
+    nt3 = tf.math.multiply(nt3, self._t_v)
+    nt3 = tf.math.multiply(nt3, t_heat_capacity)
+    nt3 = tf.scalar_mul(t_z, nt3)
+    nt3 = tf.math.multiply(nt3, t_temp_minus)
+    nt3 = tf.math.divide(nt3, t_delta_t)
+
+    # Add the radiative exchange between the interior surfaces, written one
+    # pair of surfaces at a time as sum_j M_ij sigma (T_j^4 - T_i^4) with
+    # M = -ifa_inv off the diagonal. Evaluating sigma * ifa_inv @ T^4 instead
+    # leaves a source behind at a uniform temperature wherever the view
+    # factors are incomplete, and carries the sign of the flux *leaving* the
+    # surface. See net_radiative_heatflux_function_of_t.
+    nt4 = tf.zeros_like(t_temp_minus)
+    if self.include_radiative_heat_transfer:
+      sigma = tf.constant(5.67e-8, dtype=tf.float32)
+      t_temp_interior_wall_4 = tf.math.pow(t_temp_interior_wall, 4)
+      t_exchange = tf.math.negative(
+          tf.linalg.set_diag(
+              t_ifa_inv, tf.zeros(tf.shape(t_ifa_inv)[0], dtype=tf.float32)
+          )
+      )
+      # Ensure both tensors have the same dtype for matrix multiplication
+      nt4_temp = tf.math.subtract(
+          tf.linalg.matmul(t_exchange, t_temp_interior_wall_4),
+          tf.math.multiply(
+              tf.math.reduce_sum(t_exchange, axis=1, keepdims=True),
+              t_temp_interior_wall_4,
+          ),
+      )
+      nt4_temp = tf.math.multiply(nt4_temp, sigma)
+
+      # Use tensor_scatter_nd_update to update specific indices
+      indices = tf.where(self.building.lwx_index >= 0)
+      # Extract the specific elements from nt4_temp and flatten to match nt4
+      # shape
+      updates = tf.gather(
+          tf.squeeze(
+              nt4_temp
+          ),  # Remove the extra dimension from [26,1] to [26]
+          self.building.lwx_index[self.building.lwx_index >= 0],
+      )
+      nt4 = tf.tensor_scatter_nd_update(nt4, indices, updates)
+      # ifa_inv @ (T^-)^4 is a heat flux in W/m^2, so it only enters the
+      # balance once multiplied by the area it crosses. An edge CV exposes
+      # one full face and a corner CV two half faces, so either way the
+      # exposed area is delta_x * z. The iterative simulator already does
+      # this; without it the two solvers disagree by that factor.
+      nt4 = tf.scalar_mul(
+          tf.constant(self.building.cv_size_cm / 100.0, dtype=tf.float32) * t_z,
+          nt4,
+      )
+
+    # Add interior mass coupling term: K_mass * U * V / Z * T_mass
+    nt5 = tf.zeros_like(t_temp_minus)
+    if self.include_interior_mass:
+      nt5 = tf.math.multiply(self._t_interior_mass_conductivity, self._t_u)
+      nt5 = tf.math.multiply(nt5, self._t_v)
+      nt5 = tf.math.multiply(nt5, t_temp_mass)
+      nt5 = tf.math.divide(nt5, t_z)
+
+    # Add the u-z, u-v surface transfer, absorption, external source,
+    #  and interior mass terms.
+    t_numer = tf.math.add(nt1, nt2)
+    t_numer = tf.math.add(t_numer, nt3)
+    t_numer = tf.math.add(t_numer, t_input_q)
+    t_numer = tf.math.add(t_numer, nt4)
+    t_numer = tf.math.add(t_numer, nt5)
+    return t_numer
+
   def update_temperature_estimates(
       self,
       temperature_estimates: np.ndarray,
@@ -719,14 +1216,16 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
     coupling is:
 
     $$\begin{multline}
-      T = \left[Q_x + Vz\left[K_1U^{-1}T_1 + H_1T_\infty + K_3U^{-1}T_3 +
-        H_3T_\infty\right] \right. \\
-      \left. + Uz\left[K_2V^{-1}T_2 + H_2T_\infty + K_4V^{-1}T_4 +
-        H_4T_\infty\right] \right. \\
+      T = \left[Q_x + Vz\left[\Gamma_1T_1 + \Gamma_{\infty,1}T_\infty +
+        \Gamma_3T_3 + \Gamma_{\infty,3}T_\infty\right] \right. \\
+      \left. + Uz\left[\Gamma_2T_2 + \Gamma_{\infty,2}T_\infty + \Gamma_4T_4 +
+        \Gamma_{\infty,4}T_\infty\right] \right. \\
       \left. + K_{\text{mass}}UVz^{-1}T_{\text{mass}} + Q_{\text{lwx}} +
         \frac{C\rho UVz}{\Delta t}T^{(-)}\right] \\
-      \cdot \left[Vz\left[K_1U^{-1} + H_1 + K_3U^{-1} + H_3\right] +
-        Uz\left[K_2V^{-1} + H_2 + K_4V^{-1} + H_4\right] \right. \\
+      \cdot \left[Vz\left[\Gamma_1 + \Gamma_{\infty,1} + \Gamma_3 +
+        \Gamma_{\infty,3}\right] +
+        Uz\left[\Gamma_2 + \Gamma_{\infty,2} + \Gamma_4 +
+        \Gamma_{\infty,4}\right] \right. \\
       \left. + K_{\text{mass}}UVz^{-1} +
         \frac{C\rho UVz}{\Delta t}\right]^{-1}
       \end{multline}$$
@@ -736,6 +1235,26 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
     - $T_2 = \text{shift}(T, \text{DOWN})$
     - $T_3 = \text{shift}(T, \text{RIGHT})$
     - $T_4 = \text{shift}(T, \text{UP})$
+
+    An interior face is shared by two CVs, so its conductance per unit area is
+    the inverse of the two half-cell conduction resistances in series,
+
+    $$\Gamma_1 = \left[\frac{U}{2K} + \frac{U_1}{2K_1}\right]^{-1}, \quad
+      \Gamma_2 = \left[\frac{V}{2K} + \frac{V_2}{2K_2}\right]^{-1},$$
+
+    and likewise for $\Gamma_3$ and $\Gamma_4$. A face that opens onto the
+    ambient instead puts the convective film in series with the outer half
+    cell,
+
+    $$\Gamma_{\infty,1} = \Gamma_{\infty,3} =
+        \left[\frac{1}{H_{ext}} + \frac{U}{2K}\right]^{-1}, \quad
+      \Gamma_{\infty,2} = \Gamma_{\infty,4} =
+        \left[\frac{1}{H_{ext}} + \frac{V}{2K}\right]^{-1},$$
+
+    so $H_{ext}$ appears only on exterior boundary faces. Using $KU^{-1}$ on
+    interior faces, i.e. the owner CV's own conductivity over its own full
+    width, would make the two CVs sharing a face disagree about the heat
+    crossing it and break conservation at material interfaces.
 
     Nomenclature and Units:
     -----------------------
@@ -747,11 +1266,16 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
     - $T_\infty$: Ambient temperature (scalar) [K]
     - $Q_x$: External heat source tensor [$\mathrm{W}$]
     - $Q_{\text{lwx}}$: Longwave radiative exchange tensor [$\mathrm{W}$]
-    - $K_1, K_2, K_3, K_4$: Thermal conductivity tensors for left, down,
-      right, up faces [$\mathrm{W/(m \cdot K)}$]
+    - $K, K_1, K_2, K_3, K_4$: Thermal conductivity of the CV itself and of
+      its left, down, right and up neighbors [$\mathrm{W/(m \cdot K)}$]
+    - $\Gamma_1, \Gamma_2, \Gamma_3, \Gamma_4$: Interior face conductance
+      tensors for the left, down, right, up faces
+      [$\mathrm{W/(m^2 \cdot K)}$]
+    - $\Gamma_{\infty,f}$: Ambient face conductance tensors, nonzero only on
+      exterior boundary faces [$\mathrm{W/(m^2 \cdot K)}$]
     - $K_{\text{mass}}$: Interior mass conductivity tensor
       [$\mathrm{W/(m \cdot K)}$]
-    - $H_1, H_2, H_3, H_4$: Convection coefficient tensors for boundary CVs
+    - $H_{ext}$: Outside air convection coefficient
       [$\mathrm{W/(m^2 \cdot K)}$]
     - $U, V$: CV dimensions in x and y directions [$\mathrm{m}$]
     - $z$: CV height (floor height) [$\mathrm{m}$]
@@ -774,253 +1298,6 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
       operation.
     """
 
-    def _get_input_tensors(
-        building,
-    ) -> tuple[
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-        tf.Tensor,
-    ]:
-      """Returns the input matrices as tensors."""
-      # Convert a bunch of numpy arrays into TF tensors.
-      t_temp = tf.convert_to_tensor(temperature_estimates, dtype=tf.float32)
-      t_temp_old = tf.convert_to_tensor(temperature_estimates, dtype=tf.float32)
-      t_temp_minus = tf.convert_to_tensor(building.temp, dtype=tf.float32)
-      t_input_q = tf.convert_to_tensor(building.input_q, dtype=tf.float32)
-      t_density = tf.convert_to_tensor(building.density, dtype=tf.float32)
-      t_heat_capacity = tf.convert_to_tensor(
-          building.heat_capacity, dtype=tf.float32
-      )
-      t_z = tf.constant(building.floor_height_cm / 100.0, dtype=tf.float32)
-      if self.include_radiative_heat_transfer:
-        t_ifa_inv = tf.convert_to_tensor(building.ifa_inv, dtype=tf.float32)
-        # For radiative heat transfer, we need to combine interior wall and
-        # interior mass temperatures if interior mass is enabled
-        if self.include_interior_mass:
-          interior_mask_all = (
-              building.interior_wall_mask | building.interior_mass_mask
-          )
-          temperature_estimates_temp = np.zeros_like(temperature_estimates)
-          temperature_estimates_temp[building.interior_mass_mask] = (
-              building.interior_mass_temp[building.interior_mass_mask]
-          )
-          temperature_estimates_temp[building.interior_wall_mask] = (
-              temperature_estimates[building.interior_wall_mask]
-          )
-          t_temp_interior_wall = tf.convert_to_tensor(
-              temperature_estimates_temp[interior_mask_all], dtype=tf.float32
-          )
-        else:
-          t_temp_interior_wall = tf.convert_to_tensor(
-              temperature_estimates[building.interior_wall_mask],
-              dtype=tf.float32,
-          )
-        # Ensure t_temp_interior_wall is a column vector for matrix
-        # multiplication
-        t_temp_interior_wall = tf.reshape(t_temp_interior_wall, [-1, 1])
-      else:
-        # Create minimal zero tensors with appropriate shapes
-        # These won't be used when radiative heat transfer is disabled
-        t_ifa_inv = tf.zeros((1, 1), dtype=tf.float32)  # Minimal shape
-        t_temp_interior_wall = tf.zeros((1,), dtype=tf.float32)  # Minimal shape
-
-      # Interior mass temperature tensor
-      if self.include_interior_mass:
-        t_temp_mass = tf.convert_to_tensor(
-            building.interior_mass_temp, dtype=tf.float32
-        )
-      else:
-        t_temp_mass = tf.zeros((1, 1), dtype=tf.float32)  # Minimal shape
-
-      return (
-          t_temp,
-          t_temp_old,
-          t_temp_minus,
-          t_input_q,
-          t_density,
-          t_heat_capacity,
-          t_z,
-          t_ifa_inv,
-          t_temp_interior_wall,
-          t_temp_mass,
-      )
-
-    def _get_neighbor_temps(
-        t_temp: tf.Tensor, ambient_temperature: float
-    ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-      """Creates left, right, up, down neighbor temp matrices."""
-
-      # Create shifted tensor to be able to evaluate neighbors in the equation.
-      t_temp_left = shift_tensor_left(t_temp, padding_value=ambient_temperature)
-
-      t_temp_right = shift_tensor_right(
-          t_temp, padding_value=ambient_temperature
-      )
-
-      t_temp_above = shift_tensor_down(
-          t_temp, padding_value=ambient_temperature
-      )
-
-      t_temp_below = shift_tensor_up(t_temp, padding_value=ambient_temperature)
-
-      return (t_temp_left, t_temp_right, t_temp_above, t_temp_below)
-
-    def _get_denominator(
-        t_k1_div_u: tf.Tensor,
-        t_k3_div_u: tf.Tensor,
-        t_convection_left_edge: tf.Tensor,
-        t_convection_right_edge: tf.Tensor,
-        t_convection_top_edge: tf.Tensor,
-        t_convection_bottom_edge: tf.Tensor,
-        t_vz: tf.Tensor,
-        t_k2_div_v: tf.Tensor,
-        t_k4_div_v: tf.Tensor,
-        t_uz: tf.Tensor,
-        t_density: tf.Tensor,
-        t_heat_capacity: tf.Tensor,
-        t_z: tf.Tensor,
-        t_delta_t: tf.Tensor,
-    ) -> tf.Tensor:
-      """Returns the denominator matrix from Eqn 22 as a tensor."""
-
-      # Compute conductivity/conduction transfer terms on the v-z surface.
-      dt1 = tf.math.add(t_k1_div_u, t_k3_div_u)
-      dt1 = tf.math.add(dt1, t_convection_left_edge)
-      dt1 = tf.math.add(dt1, t_convection_right_edge)
-      dt1 = tf.math.multiply(t_vz, dt1)
-
-      # Compute conductivity/conduction transfer terms on the u-z surface.
-      dt2 = tf.math.add(t_k2_div_v, t_k4_div_v)
-      dt2 = tf.math.add(dt2, t_convection_bottom_edge)
-      dt2 = tf.math.add(dt2, t_convection_top_edge)
-      dt2 = tf.math.multiply(t_uz, dt2)
-
-      # Create the thermal absorption (storage) term: C * rho * U * V * z / dt.
-      dt3 = tf.math.multiply(t_density, self._t_u)
-      dt3 = tf.math.multiply(dt3, self._t_v)
-      dt3 = tf.math.multiply(dt3, t_heat_capacity)
-      dt3 = tf.scalar_mul(t_z, dt3)
-      dt3 = tf.math.divide(dt3, t_delta_t)
-
-      # Add interior mass coupling term: K_mass * U * V / Z
-      dt4 = tf.zeros_like(dt3)
-      if self.include_interior_mass:
-        dt4 = tf.math.multiply(self._t_interior_mass_conductivity, self._t_u)
-        dt4 = tf.math.multiply(dt4, self._t_v)
-        dt4 = tf.math.divide(dt4, t_z)
-
-      # Sum up u-z, u-v surface transfer, absorption, and interior mass terms.
-      t_denom = tf.math.add(dt1, dt2)
-      t_denom = tf.math.add(t_denom, dt3)
-      t_denom = tf.math.add(t_denom, dt4)
-      return t_denom
-
-    def _get_numerator(
-        t_k1_div_u: tf.Tensor,
-        t_k3_div_u: tf.Tensor,
-        t_convection_left_edge: tf.Tensor,
-        t_convection_right_edge: tf.Tensor,
-        t_convection_top_edge: tf.Tensor,
-        t_convection_bottom_edge: tf.Tensor,
-        t_vz: tf.Tensor,
-        t_k2_div_v: tf.Tensor,
-        t_k4_div_v: tf.Tensor,
-        t_uz: tf.Tensor,
-        t_density: tf.Tensor,
-        t_heat_capacity: tf.Tensor,
-        t_z: tf.Tensor,
-        t_delta_t: tf.Tensor,
-        t_temp_left: tf.Tensor,
-        t_temp_right: tf.Tensor,
-        t_temp_above: tf.Tensor,
-        t_temp_below: tf.Tensor,
-        t_temp_inf: tf.Tensor,
-        t_input_q: tf.Tensor,
-        t_temp_minus: tf.Tensor,
-        t_ifa_inv: tf.Tensor,
-        t_temp_interior_wall: tf.Tensor,
-        t_temp_mass: tf.Tensor,
-    ) -> tf.Tensor:
-      """Returns the numerator matrix from Eqn 22 as a tensor."""
-
-      # Compute numerator's conductivity transfer terms.
-      t_k1_div_u_temp_left = tf.math.multiply(t_k1_div_u, t_temp_left)
-      t_k3_div_u_temp_right = tf.math.multiply(t_k3_div_u, t_temp_right)
-      t_k2_div_v_temp_below = tf.math.multiply(t_k2_div_v, t_temp_below)
-      t_k4_div_v_temp_above = tf.math.multiply(t_k4_div_v, t_temp_above)
-
-      # Compute numerator's convection transfer terms.
-      t_h_left_tinf = tf.math.scalar_mul(t_temp_inf, t_convection_left_edge)
-      t_h_right_tinf = tf.math.scalar_mul(t_temp_inf, t_convection_right_edge)
-      t_h_above_tinf = tf.math.scalar_mul(t_temp_inf, t_convection_top_edge)
-      t_h_below_tinf = tf.math.scalar_mul(t_temp_inf, t_convection_bottom_edge)
-
-      # Merge the conduction/convection transfer terms across the v-z surfaces.
-      nt1 = tf.math.add(t_k1_div_u_temp_left, t_k3_div_u_temp_right)
-      nt1 = tf.math.add(nt1, t_h_left_tinf)
-      nt1 = tf.math.add(nt1, t_h_right_tinf)
-      nt1 = tf.math.multiply(t_vz, nt1)
-
-      # Merge the conduction/convection transfer terms across the u-z surfaces.
-      nt2 = tf.math.add(t_k2_div_v_temp_below, t_k4_div_v_temp_above)
-      nt2 = tf.math.add(nt2, t_h_below_tinf)
-      nt2 = tf.math.add(nt2, t_h_above_tinf)
-      nt2 = tf.math.multiply(t_uz, nt2)
-
-      # Create the thermal absorption (storage) term:
-      # C * rho * U * V * z / dt * T^(-).
-      nt3 = tf.math.multiply(t_density, self._t_u)
-      nt3 = tf.math.multiply(nt3, self._t_v)
-      nt3 = tf.math.multiply(nt3, t_heat_capacity)
-      nt3 = tf.scalar_mul(t_z, nt3)
-      nt3 = tf.math.multiply(nt3, t_temp_minus)
-      nt3 = tf.math.divide(nt3, t_delta_t)
-
-      # add ratdative heat transfer sigma*ifa_inv@(T-)^4
-      nt4 = tf.zeros_like(t_temp_minus)
-      if self.include_radiative_heat_transfer:
-        sigma = tf.constant(5.67e-8, dtype=tf.float32)
-        t_temp_interior_wall_4 = tf.math.pow(t_temp_interior_wall, 4)
-        # Ensure both tensors have the same dtype for matrix multiplication
-        nt4_temp = tf.linalg.matmul(t_ifa_inv, t_temp_interior_wall_4)
-        nt4_temp = tf.math.multiply(nt4_temp, sigma)
-
-        # Use tensor_scatter_nd_update to update specific indices
-        indices = tf.where(self.building.lwx_index >= 0)
-        # Extract the specific elements from nt4_temp and flatten to match nt4
-        # shape
-        updates = tf.gather(
-            tf.squeeze(
-                nt4_temp
-            ),  # Remove the extra dimension from [26,1] to [26]
-            self.building.lwx_index[self.building.lwx_index >= 0],
-        )
-        nt4 = tf.tensor_scatter_nd_update(nt4, indices, updates)
-
-      # Add interior mass coupling term: K_mass * U * V / Z * T_mass
-      nt5 = tf.zeros_like(t_temp_minus)
-      if self.include_interior_mass:
-        nt5 = tf.math.multiply(self._t_interior_mass_conductivity, self._t_u)
-        nt5 = tf.math.multiply(nt5, self._t_v)
-        nt5 = tf.math.multiply(nt5, t_temp_mass)
-        nt5 = tf.math.divide(nt5, t_z)
-
-      # Add the u-z, u-v surface transfer, absorption, external source,
-      #  and interior mass terms.
-      t_numer = tf.math.add(nt1, nt2)
-      t_numer = tf.math.add(t_numer, nt3)
-      t_numer = tf.math.add(t_numer, t_input_q)
-      t_numer = tf.math.add(t_numer, nt4)
-      t_numer = tf.math.add(t_numer, nt5)
-      return t_numer
-
     # Get the inputs to the equation as Tensors from the building.
     (
         t_temp,
@@ -1033,22 +1310,24 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
         t_ifa_inv,
         t_temp_interior_wall,
         t_temp_mass,
-    ) = _get_input_tensors(self.building)
+    ) = self._get_input_tensors(self.building, temperature_estimates)
 
     (
-        t_convection_left_edge,
-        t_convection_right_edge,
-        t_convection_top_edge,
-        t_convection_bottom_edge,
-    ) = get_oriented_convection_coefficient_tensors(
+        t_gamma_ambient_left,
+        t_gamma_ambient_right,
+        t_gamma_ambient_top,
+        t_gamma_ambient_bottom,
+    ) = get_oriented_ambient_conductance_tensors(
         convection_coefficient,
-        self.building.temp.shape,
+        self.building.conductivity,
+        self._t_u,
+        self._t_v,
         self._boundary_cv_mapping,
     )
 
     # Create shifted tensor to be able to evaluate neighbors in the equation.
-    t_temp_left, t_temp_right, t_temp_above, t_temp_below = _get_neighbor_temps(
-        t_temp, ambient_temperature
+    (t_temp_left, t_temp_right, t_temp_above, t_temp_below) = (
+        self._get_neighbor_temps(t_temp, ambient_temperature)
     )
 
     # Get the ambinet temperature as a tensor.
@@ -1061,22 +1340,24 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
     t_uz = tf.scalar_mul(t_z, self._t_u)
     t_vz = tf.scalar_mul(t_z, self._t_v)
 
-    # Calculate the denominator terms.
-    t_k1_div_u = tf.math.divide(self._t_conductivity_left_edge, self._t_u)
-    t_k3_div_u = tf.math.divide(self._t_conductivity_right_edge, self._t_u)
-    t_k2_div_v = tf.math.divide(self._t_conductivity_bottom_edge, self._t_v)
-    t_k4_div_v = tf.math.divide(self._t_conductivity_top_edge, self._t_v)
+    # Interior face conductances already account for the half cell on either
+    # side of the face, so they are used as-is rather than divided by the
+    # owner CV's own width.
+    t_gamma_left = self._t_face_conductance_left
+    t_gamma_right = self._t_face_conductance_right
+    t_gamma_bottom = self._t_face_conductance_bottom
+    t_gamma_top = self._t_face_conductance_top
 
-    t_denom = _get_denominator(
-        t_k1_div_u,
-        t_k3_div_u,
-        t_convection_left_edge,
-        t_convection_right_edge,
-        t_convection_top_edge,
-        t_convection_bottom_edge,
+    t_denom = self._get_denominator(
+        t_gamma_left,
+        t_gamma_right,
+        t_gamma_ambient_left,
+        t_gamma_ambient_right,
+        t_gamma_ambient_top,
+        t_gamma_ambient_bottom,
         t_vz,
-        t_k2_div_v,
-        t_k4_div_v,
+        t_gamma_bottom,
+        t_gamma_top,
         t_uz,
         t_density,
         t_heat_capacity,
@@ -1085,16 +1366,16 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
     )
 
     # Calculate the numerator terms
-    t_numer = _get_numerator(
-        t_k1_div_u,
-        t_k3_div_u,
-        t_convection_left_edge,
-        t_convection_right_edge,
-        t_convection_top_edge,
-        t_convection_bottom_edge,
+    t_numer = self._get_numerator(
+        t_gamma_left,
+        t_gamma_right,
+        t_gamma_ambient_left,
+        t_gamma_ambient_right,
+        t_gamma_ambient_top,
+        t_gamma_ambient_bottom,
         t_vz,
-        t_k2_div_v,
-        t_k4_div_v,
+        t_gamma_bottom,
+        t_gamma_top,
         t_uz,
         t_density,
         t_heat_capacity,

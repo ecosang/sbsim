@@ -103,14 +103,14 @@ def net_radiative_heatflux_function_of_t(
     T: np.ndarray, ifa_inv: np.ndarray
 ) -> np.array:
   r"""
-  Calculates the net radiative heat flux and radiosity for all surfaces given
+  Calculates the net radiative heat flux gained by all surfaces given
     surface temperatures.
 
   Equations:
   --------------------
   The net radiative heat flux leaving surface $i$ is:
 
-  $$q_i = J_i - G_i$$
+  $$q^{out}_i = J_i - G_i$$
 
   where:
   - $J_i$ is the radiosity (total outgoing radiative flux) from surface $i$,
@@ -144,16 +144,50 @@ def net_radiative_heatflux_function_of_t(
 
   The net heat flux vector for all surfaces is:
 
-  $$\mathbf{q}=
-  (\mathbf{I}-\tilde{\mathbf{F}})\tilde{\mathbf{A}}^{-1}\mathbf{E}_b$$
+  $$\mathbf{q}^{out}=
+  (\mathbf{I}-\tilde{\mathbf{F}})\tilde{\mathbf{A}}^{-1}\mathbf{E}_b
+  = \mathbf{IFA}_{inv}\mathbf{E}_b$$
 
   where $\tilde{\mathbf{F}}$ is the matrix of view factors,
     $F_{ij}$ and$\mathbf{E}_b$ is $\sigma \mathbf{T}^4$.
 
+  Pairwise (difference) form:
+  ---------------------------
+  The energy balance needs the flux the surface *gains*, $q_i = -q^{out}_i$,
+  and it needs it to vanish when the enclosure is isothermal - no net heat can
+  move by radiation between surfaces that are all at the same temperature.
+  Evaluating $\mathbf{IFA}_{inv}\mathbf{E}_b$ directly only satisfies that if
+  every row of $\mathbf{IFA}_{inv}$ sums to zero, which in turn requires the
+  view factors to be complete, $\sum_j F_{ij} = 1$. View factors obtained from
+  a line of sight approximation on a discretized floor plan are not, and the
+  leftover row sum turns into a heat source that is present even at a uniform
+  temperature.
+
+  Writing the exchange one pair of surfaces at a time removes that failure
+  mode. With
+
+  $$M_{ij} = -(\mathbf{IFA}_{inv})_{ij} \ge 0 \quad (i \neq j), \qquad
+    M_{ii} = 0,$$
+
+  the flux gained by surface $i$ is
+
+  $$q_i = \sum_{j \neq i} M_{ij}\left(E_{b,j} - E_{b,i}\right)
+        = \sum_{j \neq i} M_{ij}\,\sigma\left(T_j^4 - T_i^4\right),$$
+
+  which is identically zero at a uniform temperature whatever the view
+  factors are, and which keeps the sign right: a surface hotter than its
+  surroundings loses heat. For a complete enclosure the two forms agree
+  exactly, since then $(\mathbf{IFA}_{inv})_{ii} = -\sum_{j \neq i}
+  (\mathbf{IFA}_{inv})_{ij}$. This is the form EnergyPlus uses in
+  ``CalcInteriorRadExchange``, where the self term of the exchange matrix is
+  zeroed and the sum is taken over $T_j^4 - T_i^4$.
+
   Nomenclature and Units:
   -----------------------
-  - $q_i$        : Net radiative heat flux from surface $i$ [$\mathrm{W/m^2}$]
+  - $q_i$        : Net radiative heat flux gained by surface $i$
+                    [$\mathrm{W/m^2}$]
   - $\mathbf{q}$ : Vector of $q_i$ for all $i=1..n$ [$\mathrm{W/m^2}$]
+  - $M_{ij}$     : Pairwise radiative exchange coefficient [dimensionless]
   - $J_i$        : Radiosity of surface $i$ [$\mathrm{W/m^2}$]
   - $\mathbf{J}$ : Vector of $J_i$ for all $i=1..n$ [$\mathrm{W/m^2}$]
   - $G_i$        : Irradiation on surface $i$ [$\mathrm{W/m^2}$]
@@ -182,15 +216,18 @@ def net_radiative_heatflux_function_of_t(
     ifa_inv (np.ndarray): (I - F) @ A_inv.
 
   Returns:
-      q : Net radiative heat flux [W/m^2]
+      q : Net radiative heat flux gained by each surface [W/m^2]. Positive
+        means the surface is being heated by the rest of the enclosure.
 
   """
   sigma = (
       constants.STEFAN_BOLTZMANN_CONSTANT
   )  # [W/m^2K^4] Stefan-Boltzmann constant
 
-  q = sigma * ifa_inv @ np.power(T, 4)
-  return q
+  exchange = -np.array(ifa_inv, dtype=float)
+  np.fill_diagonal(exchange, 0.0)
+  emissive_power = sigma * np.power(np.asarray(T, dtype=float), 4)
+  return exchange @ emissive_power - exchange.sum(axis=1) * emissive_power
 
 
 def mark_air_connected_interior_walls(
@@ -368,7 +405,7 @@ def fix_view_factors(F: np.ndarray, A: np.ndarray = None) -> np.ndarray:
       Fixed view factor matrix
 
   References:
-      See `FixViewFactors` function in [EnergyPlus](https://github.com/NREL/EnergyPlus/blob/develop/src/EnergyPlus/HeatBalanceIntRadExchange.cc) # pylint: disable=line-too-long
+      See `FixViewFactors` function in [EnergyPlus](https://github.com/NatLabRockies/EnergyPlus/blob/develop/src/EnergyPlus/HeatBalanceIntRadExchange.cc) # pylint: disable=line-too-long
   """
 
   # Parameter definitions
@@ -396,6 +433,15 @@ def fix_view_factors(F: np.ndarray, A: np.ndarray = None) -> np.ndarray:
 
   # OriginalCheckValue is the first pass at a completeness check
   results['original_check_value'] = abs(np.sum(F) - N)
+
+  # EnergyPlus converges the fix on |sum(F) - N|, which is one number for the
+  # whole enclosure. get_vf hands over rows that each sum to exactly one, so
+  # that test is already satisfied before the loop starts and the routine
+  # returns after the single pass that trades the row closure away for
+  # reciprocity - the rows come back out anywhere between 0.71 and 2.17.
+  # Converge on the worst row instead, which is the quantity the enclosure
+  # balance depends on. The global sum is kept for reporting.
+  original_row_closure = np.max(np.abs(np.sum(F, axis=0) - 1.0))
 
   # Allocate and initialize arrays
   FixedAF = F.copy()  # store for largest area check
@@ -492,7 +538,7 @@ def fix_view_factors(F: np.ndarray, A: np.ndarray = None) -> np.ndarray:
             FixedF[j, i] = 0.0
             FixedAF[j, i] = 0.0
 
-    ConvrgNew = abs(np.sum(FixedF) - N)
+    ConvrgNew = np.max(np.abs(np.sum(FixedF, axis=0) - 1.0))
 
     # Check convergence
     if (
@@ -520,27 +566,23 @@ def fix_view_factors(F: np.ndarray, A: np.ndarray = None) -> np.ndarray:
       )
       results['row_sum'] = sum_FixedF
 
-      if abs(results['fixed_check_value']) < abs(
-          results['original_check_value']
-      ):
-        F[:] = FixedF
-        results['final_check_value'] = results['fixed_check_value']
+      F[:] = FixedF
+      results['final_check_value'] = results['fixed_check_value']
 
       return F.T
 
-  # Normal completion
+  # Normal completion. The loop always ends on a reciprocity pass, and exact
+  # reciprocity is what makes the enclosure conserve energy: with A_i F_ij =
+  # A_j F_ji the pairwise exchange between any two surfaces is equal and
+  # opposite, so the heat the enclosure gains sums to zero. Closure cannot be
+  # had at the same time on a floor plan whose line of sight view factors do
+  # not close, so keep the reciprocal matrix and report how far the rows are
+  # from one.
   results['fixed_check_value'] = ConvrgNew
-
-  if results['fixed_check_value'] < results['original_check_value']:
-    F[:] = FixedF
-    results['final_check_value'] = results['fixed_check_value']
-  else:
-    results['final_check_value'] = results['original_check_value']
-    results['row_sum'] = np.sum(FixedF)
-
-    if abs(results['row_sum'] - N) < PRIMARY_CONVERGENCE:
-      F[:] = FixedF
-      results['final_check_value'] = results['fixed_check_value']
+  results['row_sum'] = np.sum(FixedF)
+  F[:] = FixedF
+  results['final_check_value'] = ConvrgNew
+  del original_row_closure
 
   if severe_error_present:
     raise RuntimeError(

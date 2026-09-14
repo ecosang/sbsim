@@ -106,7 +106,11 @@ class BuildingRadiationUtilsTest(absltest.TestCase):
     flux for each surface given their temperatures and the IFA inverse matrix.
 
     Uses a 3-surface system with temperatures [1200, 500, 1102] K and
-    the IFA inverse matrix from the previous test.
+    the IFA inverse matrix from the previous test. The function returns the
+    flux each surface *gains*, so the hottest surface comes out negative. This
+    enclosure is complete - every row of the IFA inverse sums to zero - so the
+    pairwise form the function evaluates agrees exactly with ifa_inv @ E_b up
+    to that sign.
     """
     # fmt: off
     #pylint:disable=line-too-long
@@ -118,7 +122,7 @@ class BuildingRadiationUtilsTest(absltest.TestCase):
     ])
     # fmt: on
     # pylint:enable=line-too-long
-    expected_q = np.array([3.70061961e04, -3.69724724e04, -3.37237040e01])
+    expected_q = np.array([-3.70061961e04, 3.69724723e04, 3.37237348e01])
 
     q = utils.net_radiative_heatflux_function_of_t(temperatures, ifa_inv)
 
@@ -126,6 +130,18 @@ class BuildingRadiationUtilsTest(absltest.TestCase):
       assert_array_almost_equal(
           np.round(q, 4), np.round(expected_q, 4), decimal=4
       )
+
+    with self.subTest("an isothermal enclosure exchanges nothing"):
+      assert_array_almost_equal(
+          utils.net_radiative_heatflux_function_of_t(
+              np.full_like(temperatures, 900), ifa_inv
+          ),
+          np.zeros_like(expected_q),
+          decimal=9,
+      )
+
+    with self.subTest("what one surface loses the others gain"):
+      self.assertAlmostEqual(float(np.sum(q)), 0.0, places=3)
 
   def test_mark_air_connected_interior_walls(self):
     """Test identification of interior walls connected through air spaces.
