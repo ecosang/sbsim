@@ -106,7 +106,11 @@ class BuildingRadiationUtilsTest(absltest.TestCase):
     flux for each surface given their temperatures and the IFA inverse matrix.
 
     Uses a 3-surface system with temperatures [1200, 500, 1102] K and
-    the IFA inverse matrix from the previous test.
+    the IFA inverse matrix from the previous test. The function returns the
+    flux each surface *gains*, so the hottest surface comes out negative. This
+    enclosure is complete - every row of the IFA inverse sums to zero - so the
+    pairwise form the function evaluates agrees exactly with ifa_inv @ E_b up
+    to that sign.
     """
     # fmt: off
     #pylint:disable=line-too-long
@@ -118,13 +122,104 @@ class BuildingRadiationUtilsTest(absltest.TestCase):
     ])
     # fmt: on
     # pylint:enable=line-too-long
-    expected_q = np.array([3.70061961e04, -3.69724724e04, -3.37237040e01])
+    expected_q = np.array([-3.70061961e04, 3.69724723e04, 3.37237348e01])
 
     q = utils.net_radiative_heatflux_function_of_t(temperatures, ifa_inv)
 
     with self.subTest("q results as expected"):
       assert_array_almost_equal(
           np.round(q, 4), np.round(expected_q, 4), decimal=4
+      )
+
+    with self.subTest("an isothermal enclosure exchanges nothing"):
+      assert_array_almost_equal(
+          utils.net_radiative_heatflux_function_of_t(
+              np.full_like(temperatures, 900), ifa_inv
+          ),
+          np.zeros_like(expected_q),
+          decimal=9,
+      )
+
+    with self.subTest("what one surface loses the others gain"):
+      self.assertAlmostEqual(float(np.sum(q)), 0.0, places=3)
+
+  def test_linearized_radiative_exchange(self):
+    """Tests the split of the radiative exchange into diagonal and source.
+
+    linearized_radiative_exchange rewrites sum_j M_ij sigma (T_j^4 - T_i^4) as
+    sum_j M_ij h_ij (T_j - T_i) using the exact factorization
+    h_ij = sigma (T_i^2 + T_j^2)(T_i + T_j). Nothing is approximated, so the
+    two forms have to agree to round-off no matter how far apart the
+    temperatures are - that is the property the solvers rely on when they move
+    the self term onto the denominator.
+    """
+    # fmt: off
+    # pylint:disable=line-too-long
+    ifa_inv = np.array([
+        [0.64069264, -0.19047619, -0.45021645],
+        [-0.19047619, 0.38095238, -0.19047619],
+        [-0.45021645, -0.19047619, 0.64069264],
+    ])
+    # fmt: on
+    # pylint:enable=line-too-long
+
+    with self.subTest("the split reproduces the explicit flux"):
+      # A wide spread is the hard case: the secant h_ij is far from any single
+      # 4 sigma Tbar^3 evaluated at one end.
+      for temperatures in (
+          np.array([1200.0, 500.0, 1102.0]),
+          np.array([290.0, 295.0, 293.0]),
+          np.array([200.0, 2000.0, 800.0]),
+      ):
+        coefficient, driving = utils.linearized_radiative_exchange(
+            temperatures, ifa_inv
+        )
+        expected = utils.net_radiative_heatflux_function_of_t(
+            temperatures, ifa_inv
+        )
+        # net_radiative_heatflux_function_of_t returns the flux gained, and so
+        # does driving - coefficient * T.
+        np.testing.assert_allclose(
+            driving - coefficient * temperatures,
+            expected,
+            rtol=1e-12,
+            atol=1e-9,
+        )
+
+    with self.subTest("an isothermal enclosure exchanges nothing"):
+      temperatures = np.full(3, 900.0)
+      coefficient, driving = utils.linearized_radiative_exchange(
+          temperatures, ifa_inv
+      )
+      np.testing.assert_allclose(
+          driving - coefficient * temperatures, np.zeros(3), atol=1e-9
+      )
+
+    with self.subTest("the coefficient is nonnegative"):
+      # This is what makes the update a convex combination and therefore
+      # bounded: the diagonal it adds is exactly the sum of the numerator
+      # weights it adds.
+      coefficient, _ = utils.linearized_radiative_exchange(
+          np.array([290.0, 300.0, 310.0]), ifa_inv
+      )
+      self.assertTrue(np.all(coefficient >= 0.0))
+
+    with self.subTest("a small spread recovers the textbook 4 sigma Tbar^3"):
+      # h_ij is the secant of sigma T^4 between the pair's two temperatures;
+      # 4 sigma Tbar^3 is its T_i -> T_j limit. Comparing against one Tbar for
+      # the whole enclosure leaves an error of order the spread over Tbar, so
+      # the tolerance below tracks the spread rather than round-off.
+      temperatures = np.array([299.99, 300.0, 300.01])
+      coefficient, _ = utils.linearized_radiative_exchange(
+          temperatures, ifa_inv
+      )
+      exchange = -ifa_inv.copy()
+      np.fill_diagonal(exchange, 0.0)
+      textbook = (
+          4.0 * constants.STEFAN_BOLTZMANN_CONSTANT * np.mean(temperatures) ** 3
+      )
+      np.testing.assert_allclose(
+          coefficient, exchange.sum(axis=1) * textbook, rtol=1e-4
       )
 
   def test_mark_air_connected_interior_walls(self):
@@ -223,6 +318,235 @@ class BuildingRadiationUtilsTest(absltest.TestCase):
     # result has same shape as the temperatures array:
     with self.subTest("air-connected interior walls correctly marked"):
       assert_array_almost_equal(result, expected_result)
+
+  def test_mark_air_connected_interior_walls_also_mark_air(self):
+    """Test that also_mark_air marks the air cells of the connected enclosure.
+
+    The AreaRatio view factor method has no line-of-sight sweep to mark the air
+    cells that carry interior mass nodes, so it asks
+    mark_air_connected_interior_walls for them directly. The extracted interior
+    space must be unaffected.
+    """
+    # fmt: off
+    # pylint:disable=line-too-long
+    indexed_floor_plan = \
+      np.array([[-3, -3, -3, -3],
+                [-3,  0,  0, -3],
+                [-3,  0,  0, -3],
+                [-3, -3, -3, -3]])
+
+    expected_result = \
+      np.array([[ -3, -33, -33,  -3],
+                [-33,   9,   9, -33],
+                [-33,   9,   9, -33],
+                [ -3, -33, -33,  -3]])
+    # fmt: on
+    # pylint:enable=line-too-long
+    result, interior_space = utils.mark_air_connected_interior_walls(
+        indexed_floor_plan=indexed_floor_plan,
+        start_pos=(1, 1),
+        also_mark_air=True,
+    )
+
+    with self.subTest("connected air marked with AIR_IN_LINE_OF_SIGHT"):
+      assert_array_almost_equal(result, expected_result)
+
+    with self.subTest("extracted interior space still uses the air value"):
+      self.assertEqual(
+          np.sum(interior_space == constants.INTERIOR_SPACE_VALUE_IN_FUNCTION),
+          4,
+      )
+
+    with self.subTest("default leaves air untouched"):
+      unmarked, _ = utils.mark_air_connected_interior_walls(
+          indexed_floor_plan=indexed_floor_plan, start_pos=(1, 1)
+      )
+      self.assertEqual(np.sum(unmarked == AIR_IN_LINE_OF_SIGHT), 0)
+
+  def test_get_vf_area_ratio_is_uniform_over_the_enclosure(self):
+    """Test that AreaRatio spreads each row evenly over its enclosure.
+
+    Every CV in the grid has the same face area, so the EnergyPlus area ratio
+    A_j / sum_{k != i} A_k collapses to a uniform 1 / (n - 1). That makes the
+    matrix satisfy reciprocity and closure at the same time, which is what
+    ScriptF cannot do.
+    """
+    # fmt: off
+    # pylint:disable=line-too-long
+    indexed_floor_plan = \
+      np.array([[-3, -3, -3, -3],
+                [-3,  0,  0, -3],
+                [-3,  0,  0, -3],
+                [-3, -3, -3, -3]])
+    # fmt: on
+    # pylint:enable=line-too-long
+    interior_wall_mask = utils.mark_interior_wall_adjacent_to_air(
+        indexed_floor_plan
+    )
+    n = int(np.sum(interior_wall_mask))
+    vf = utils.get_vf(
+        indexed_floor_plan=indexed_floor_plan,
+        interior_wall_mask=interior_wall_mask,
+        view_factor_method="AreaRatio",
+    )
+
+    # The four corner cells of the ring are not adjacent to any air cell.
+    with self.subTest("only air adjacent walls participate"):
+      self.assertEqual(n, 8)
+      self.assertEqual(vf.shape, (8, 8))
+
+    with self.subTest("no surface sees itself"):
+      assert_array_almost_equal(np.diag(vf), np.zeros(n))
+
+    with self.subTest("rows close to one"):
+      assert_array_almost_equal(np.sum(vf, axis=1), np.ones(n))
+
+    with self.subTest("reciprocity holds for equal areas"):
+      assert_array_almost_equal(vf, vf.T)
+
+    with self.subTest("off diagonal is uniform"):
+      expected = np.full((n, n), 1.0 / (n - 1))
+      np.fill_diagonal(expected, 0.0)
+      assert_array_almost_equal(vf, expected)
+
+  def test_get_vf_area_ratio_keeps_disconnected_rooms_apart(self):
+    """Test that an enclosure stops at the air space it is connected to.
+
+    Two rooms separated by a wall two cells thick share no air, so neither
+    room's surfaces may see the other's. A doorway between them merges the two
+    into a single enclosure.
+    """
+    # fmt: off
+    # pylint:disable=line-too-long
+    separated = \
+      np.array([[-3, -3, -3, -3, -3, -3, -3, -3],
+                [-3,  0,  0, -3, -3,  0,  0, -3],
+                [-3,  0,  0, -3, -3,  0,  0, -3],
+                [-3, -3, -3, -3, -3, -3, -3, -3]])
+
+    # A doorway at (1, 3) and (1, 4) joins the two air spaces.
+    joined = \
+      np.array([[-3, -3, -3, -3, -3, -3, -3, -3],
+                [-3,  0,  0,  0,  0,  0,  0, -3],
+                [-3,  0,  0, -3, -3,  0,  0, -3],
+                [-3, -3, -3, -3, -3, -3, -3, -3]])
+    # fmt: on
+    # pylint:enable=line-too-long
+    separated_mask = utils.mark_interior_wall_adjacent_to_air(separated)
+    separated_vf = utils.get_vf(
+        indexed_floor_plan=separated,
+        interior_wall_mask=separated_mask,
+        view_factor_method="AreaRatio",
+    )
+    n_separated = int(np.sum(separated_mask))
+
+    with self.subTest("each room only sees its own eight surfaces"):
+      # Surfaces are enumerated row major, so the left room is not a
+      # contiguous block. Count instead: every surface sees exactly the seven
+      # others of its own room.
+      self.assertEqual(n_separated, 16)
+      assert_array_almost_equal(
+          np.sum(separated_vf > 0, axis=1), np.full(n_separated, 7)
+      )
+      assert_array_almost_equal(
+          np.sum(separated_vf, axis=1), np.ones(n_separated)
+      )
+
+    joined_mask = utils.mark_interior_wall_adjacent_to_air(joined)
+    joined_vf = utils.get_vf(
+        indexed_floor_plan=joined,
+        interior_wall_mask=joined_mask,
+        view_factor_method="AreaRatio",
+    )
+    n_joined = int(np.sum(joined_mask))
+
+    with self.subTest("a doorway merges the two rooms into one enclosure"):
+      assert_array_almost_equal(
+          np.sum(joined_vf > 0, axis=1), np.full(n_joined, n_joined - 1)
+      )
+      assert_array_almost_equal(joined_vf, joined_vf.T)
+
+  def test_get_vf_area_ratio_includes_interior_mass_nodes(self):
+    """Test that interior mass nodes join the enclosure of their air space.
+
+    Interior mass nodes sit on air cells rather than wall cells, so AreaRatio
+    relies on also_mark_air to pull them into the enclosure.
+    """
+    # fmt: off
+    # pylint:disable=line-too-long
+    indexed_floor_plan = \
+      np.array([[-3, -3, -3, -3],
+                [-3,  0,  0, -3],
+                [-3,  0,  0, -3],
+                [-3, -3, -3, -3]])
+    # fmt: on
+    # pylint:enable=line-too-long
+    interior_wall_mask = utils.mark_interior_wall_adjacent_to_air(
+        indexed_floor_plan
+    )
+    interior_mass_mask = (
+        indexed_floor_plan == constants.INTERIOR_SPACE_VALUE_IN_FUNCTION
+    )
+    vf = utils.get_vf(
+        indexed_floor_plan=indexed_floor_plan,
+        interior_wall_mask=interior_wall_mask,
+        view_factor_method="AreaRatio",
+        interior_mass_mask=interior_mass_mask,
+    )
+    n = int(np.sum(interior_wall_mask | interior_mass_mask))
+
+    with self.subTest("eight walls plus four mass nodes"):
+      self.assertEqual(n, 12)
+      self.assertEqual(vf.shape, (12, 12))
+
+    with self.subTest("rows close to one"):
+      assert_array_almost_equal(np.sum(vf, axis=1), np.ones(n))
+
+    with self.subTest("reciprocity holds"):
+      assert_array_almost_equal(vf, vf.T)
+
+  def test_get_vf_defaults_to_area_ratio(self):
+    """Test that the default method is AreaRatio and that ScriptF still runs."""
+    # fmt: off
+    # pylint:disable=line-too-long
+    indexed_floor_plan = \
+      np.array([[-3, -3, -3, -3],
+                [-3,  0,  0, -3],
+                [-3,  0,  0, -3],
+                [-3, -3, -3, -3]])
+    # fmt: on
+    # pylint:enable=line-too-long
+    interior_wall_mask = utils.mark_interior_wall_adjacent_to_air(
+        indexed_floor_plan
+    )
+    default_vf = utils.get_vf(
+        indexed_floor_plan=indexed_floor_plan,
+        interior_wall_mask=interior_wall_mask,
+    )
+    area_ratio_vf = utils.get_vf(
+        indexed_floor_plan=indexed_floor_plan,
+        interior_wall_mask=interior_wall_mask,
+        view_factor_method="AreaRatio",
+    )
+
+    with self.subTest("default matches AreaRatio"):
+      assert_array_almost_equal(default_vf, area_ratio_vf)
+
+    with self.subTest("ScriptF is still selectable"):
+      script_f_vf = utils.get_vf(
+          indexed_floor_plan=indexed_floor_plan,
+          interior_wall_mask=interior_wall_mask,
+          view_factor_method="ScriptF",
+      )
+      self.assertEqual(script_f_vf.shape, area_ratio_vf.shape)
+
+    with self.subTest("an unknown method is rejected"):
+      with self.assertRaises(ValueError):
+        utils.get_vf(
+            indexed_floor_plan=indexed_floor_plan,
+            interior_wall_mask=interior_wall_mask,
+            view_factor_method="NotAMethod",
+        )
 
   def test_mark_interior_surface_adjacent_to_air_with_fenestration(self):
     """Test that interior surfaces (walls and fenestration) are marked correctly

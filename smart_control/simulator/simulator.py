@@ -134,6 +134,12 @@ class Simulator:
     self._start_timestamp = start_timestamp
     self._relative_convergence_threshold = relative_convergence_threshold
     self._relative_convergence_streak = relative_convergence_streak
+    # Holds the interior longwave exchange for the duration of one sweep; see
+    # _get_longwave_terms. Outside a sweep it is None and the terms are
+    # recomputed on demand, so a stale field can never be read back.
+    self._longwave_terms: (
+        tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None] | None
+    ) = None
     self.reset()
 
   def reset(self):
@@ -141,6 +147,7 @@ class Simulator:
     self.building.reset()
     self._hvac.reset()
     self._current_timestamp = self._start_timestamp
+    self._longwave_terms = None
 
   @property
   def time_step_sec(self) -> float:
@@ -383,19 +390,28 @@ class Simulator:
 
     Here $q_{\text{lwx}}$ is a heat flux [W/m^2] and $q_{\text{lwx}} (u z)$ is
     the corresponding power [W] entering the CV through the wall face of area
-    $u z$.
+    $u z$. When radiative heat transfer is enabled, $q_{\text{lwx}}$ is the
+    linearized exchange from `_get_longwave_terms`, split into a coefficient
+    $h_{\text{lwx}}$ [W/m^2/K] that scales with this CV's own temperature and
+    a driving flux $q_{\text{lwx}}^{(0)}$ [W/m^2] from the rest of the
+    enclosure, so that $q_{\text{lwx}} = q_{\text{lwx}}^{(0)} -
+    h_{\text{lwx}} T_{i,j}$; the $h_{\text{lwx}} T_{i,j}$ part moves onto the
+    denominator alongside the other terms in $T_{i,j}$.
 
     Solving for $T_{i,j}$ with uniform spacing ($u = v = \delta_x$) and uniform
     conductivity ($k_1 = k_2 = k_3 = k_4 = k$):
 
     $$T_{i,j} = \frac{\sum_{\text{neighbors}} T_{\text{neighbor}} +
       \frac{Q_x}{z k} + \frac{k_{\text{mass}} \delta_x^2}{z^2 k}
-      T_{\text{mass},i,j}+\frac{q_\text{lwx}\, \delta_x}{k} + t_0 T_{i,j}^{(-)}}
-      {4 + \frac{k_{\text{mass}} \delta_x^2}{z^2 k} + t_0}$$
+      T_{\text{mass},i,j}+\frac{q_\text{lwx}^{(0)}\, \delta_x}{k}
+      + t_0 T_{i,j}^{(-)}}
+      {4 + \frac{k_{\text{mass}} \delta_x^2}{z^2 k}
+      + \frac{h_\text{lwx}\, \delta_x}{k} + t_0}$$
 
-    The $q_{\text{lwx}}$ term matches the implementation
-    `q_lwx_array[idx] * delta_x / conductivity`, i.e.
-    $\frac{q_{\text{lwx}}\, \delta_x}{k}$.
+    The $q_{\text{lwx}}$ terms match the implementation, which scales the
+    linearized coefficient and driving flux by `delta_x / conductivity`, the
+    same normalization applied to $Q_x$ (there via `/ z` folded into the
+    $\frac{Q_x}{zk}$ term above).
 
     where the temporal parameter is:
 
@@ -492,27 +508,31 @@ class Simulator:
     else:
       denominator = 4.0 + t0
 
-    # checking for implementation of `include_radiative_heat_transfer` because
-    # the `FloorPlanBasedBuilding` implements it, but the `Building` doesn't
-    if (
-        hasattr(self.building, 'include_radiative_heat_transfer')
-        and self.building.include_radiative_heat_transfer
-    ):
-      # Radiative heat transfer
-      q_lwx_array = (
-          self.building.apply_longwave_interior_radiative_heat_transfer(
-              temperature_estimates
-          )
-      )
+    # Interior longwave radiation, split into the part that scales with this
+    # CV's own temperature and the part driven by the rest of the enclosure.
+    # See _get_longwave_terms for why the split is worth making and why an
+    # interior mass node cannot use it.
+    coefficient, driving, is_wall_node = self._get_longwave_terms(
+        temperature_estimates
+    )
+    q_lwx = 0.0
+    if coefficient is not None:
       # q_lwx_idx is -1 if the CV does not have LWX
       q_lwx_idx = self.building.lwx_index[x, y]
-      q_lwx = (
-          (q_lwx_array[q_lwx_idx] * delta_x / conductivity)
-          if q_lwx_idx != -1
-          else 0.0
-      )
-    else:
-      q_lwx = 0.0
+      if q_lwx_idx != -1:
+        norm = delta_x / conductivity
+        if is_wall_node[q_lwx_idx]:
+          # This CV's temperature is the one the surface radiates at, so its
+          # own term belongs on the diagonal.
+          denominator += coefficient[q_lwx_idx] * norm
+          q_lwx = driving[q_lwx_idx] * norm
+        else:
+          # An interior mass node radiates at its mass temperature, which this
+          # balance does not solve for, so recover the explicit flux.
+          node_temp = self.building.interior_mass_temp[x, y]
+          q_lwx = (
+              driving[q_lwx_idx] - coefficient[q_lwx_idx] * node_temp
+          ) * norm
 
     return (
         neighbor_transfer + thermal_source + retained_heat + q_lwx
@@ -557,6 +577,44 @@ class Simulator:
           cv_coordinates, temperature_estimates
       )
 
+  def _get_longwave_terms(
+      self, temperature_estimates: np.ndarray
+  ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Returns the interior longwave exchange, split and held for one sweep.
+
+    The exchange couples every surface of an enclosure to every other, so
+    evaluating it costs a dense matrix product over the enclosure. Asking for
+    it once per CV, as this used to, repeats that product once for every CV in
+    the grid and throws most of the answer away. One product per sweep is
+    enough.
+
+    Doing it once per sweep evaluates the exchange at the field as it stood
+    when the sweep started rather than at the partially updated field, so the
+    radiation is Jacobi where the conduction is Gauss-Seidel. The fixed point
+    is the same either way, since at convergence the field stops moving.
+
+    The result is cached only for the duration of a sweep. An estimator called
+    on its own recomputes it, which is slower but cannot read a stale field.
+
+    Args:
+      temperature_estimates: Current temperature estimate for each CV.
+
+    Returns:
+      The coefficient [W/m^2/K], driving flux [W/m^2] and interior wall mask
+      from apply_longwave_interior_radiative_heat_transfer_linearized, or a
+      triple of None when the building has no radiative heat transfer.
+    """
+    if self._longwave_terms is not None:
+      return self._longwave_terms
+    # Checking for the attribute because FloorPlanBasedBuilding implements
+    # include_radiative_heat_transfer but the base Building does not.
+    if not getattr(self.building, 'include_radiative_heat_transfer', False):
+      return None, None, None
+    apply_linearized = (
+        self.building.apply_longwave_interior_radiative_heat_transfer_linearized
+    )
+    return apply_linearized(temperature_estimates)
+
   def update_temperature_estimates(
       self,
       temperature_estimates: np.ndarray,
@@ -581,19 +639,25 @@ class Simulator:
     nrows, ncols = temperature_estimates.shape
     max_delta = 0.0
 
-    for x in range(nrows):
-      for y in range(ncols):
-        temp_estimate = self._get_cv_temp_estimate(
-            (x, y),
-            temperature_estimates,
-            ambient_temperature,
-            convection_coefficient,
-        )
+    # One dense enclosure product for the whole sweep instead of one per CV.
+    # Cleared afterwards so nothing outside the sweep can read it back.
+    self._longwave_terms = self._get_longwave_terms(temperature_estimates)
+    try:
+      for x in range(nrows):
+        for y in range(ncols):
+          temp_estimate = self._get_cv_temp_estimate(
+              (x, y),
+              temperature_estimates,
+              ambient_temperature,
+              convection_coefficient,
+          )
 
-        delta = abs(temp_estimate - temperature_estimates[x][y])
-        max_delta = max(delta, max_delta)
+          delta = abs(temp_estimate - temperature_estimates[x][y])
+          max_delta = max(delta, max_delta)
 
-        temperature_estimates[x][y] = temp_estimate
+          temperature_estimates[x][y] = temp_estimate
+    finally:
+      self._longwave_terms = None
 
     return temperature_estimates, max_delta
 

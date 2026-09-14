@@ -829,7 +829,7 @@ class FloorPlanBasedBuilding(BaseSimulatorBuilding):
       building_exterior_radiative_properties: RadiationProperties | None = None,
       interior_mass_radiative_properties: RadiationProperties | None = None,
       include_radiative_heat_transfer: bool = False,
-      view_factor_method: str = "ScriptF",
+      view_factor_method: str = "AreaRatio",
       include_interior_mass: bool = False,
   ):
     """Initializes the New Building.
@@ -863,7 +863,11 @@ class FloorPlanBasedBuilding(BaseSimulatorBuilding):
       include_radiative_heat_transfer: bool to note whether to include radiative
         heat transfer.
       view_factor_method: str to note the method to use for view factors.
-        Either "ScriptF" or "CarrollMRT". See
+        Either "AreaRatio" (default, area weighted over the connected air
+        space, as in EnergyPlus), "ScriptF" (area weighted but restricted to
+        surfaces in an unblocked line of sight) or "CarrollMRT". See
+        `building_radiation_utils.get_vf` for the trade-off between the first
+        two, and
         [LW Radiation Exchange Among Zone Surfaces](https://bigladdersoftware.com/epx/docs/9-6/engineering-reference/inside-heat-balance.html#lw-radiation-exchange-among-zone-surfaces)
         for more details.
       interior_mass_properties: MaterialProperties for interior mass nodes
@@ -1340,21 +1344,86 @@ class FloorPlanBasedBuilding(BaseSimulatorBuilding):
 
     This function calculates the net radiative heat flux and radiosity for each
     interior wall.
+
+    Returns the exchange explicitly, evaluated at the temperatures passed in.
+    apply_longwave_interior_radiative_heat_transfer_linearized returns the same
+    exchange split so that a solver can carry part of it implicitly.
+    """
+    enclosure_temperatures, _ = self._longwave_enclosure_temperatures(
+        temperature_estimates
+    )
+    return building_radiation_utils.net_radiative_heatflux_function_of_t(
+        enclosure_temperatures, self.ifa_inv
+    )
+
+  def _longwave_enclosure_temperatures(
+      self, temperature_estimates: np.ndarray
+  ) -> tuple[np.ndarray, np.ndarray]:
+    """Returns the enclosure's temperatures and which of its nodes are walls.
+
+    The enclosure is indexed by lwx_index. An interior wall node radiates at
+    the air CV temperature sitting on it, and an interior mass node radiates
+    at its own mass temperature; the two masks are disjoint.
+
+    Args:
+      temperature_estimates: Current air CV temperature estimates.
+
+    Returns:
+      A pair of 1-D arrays in lwx_index order: the temperature of every node
+      of the enclosure, and a boolean saying whether that node is an interior
+      wall rather than an interior mass node.
     """
     if self.include_interior_mass:
       interior_mask_all = self.interior_mass_mask | self.interior_wall_mask
-      temperature_estimates_temp = np.zeros_like(temperature_estimates)
-      temperature_estimates_temp[self.interior_mass_mask] = (
-          self.interior_mass_temp[self.interior_mass_mask]
+      enclosure_temperatures = np.zeros_like(temperature_estimates)
+      enclosure_temperatures[self.interior_mass_mask] = self.interior_mass_temp[
+          self.interior_mass_mask
+      ]
+      enclosure_temperatures[self.interior_wall_mask] = temperature_estimates[
+          self.interior_wall_mask
+      ]
+      return (
+          enclosure_temperatures[interior_mask_all],
+          self.interior_wall_mask[interior_mask_all],
       )
-      temperature_estimates_temp[self.interior_wall_mask] = (
-          temperature_estimates[self.interior_wall_mask]
-      )
-      q_lwx = building_radiation_utils.net_radiative_heatflux_function_of_t(
-          temperature_estimates_temp[interior_mask_all], self.ifa_inv
-      )
-    else:
-      q_lwx = building_radiation_utils.net_radiative_heatflux_function_of_t(
-          temperature_estimates[self.interior_wall_mask], self.ifa_inv
-      )
-    return q_lwx
+    return (
+        temperature_estimates[self.interior_wall_mask],
+        np.ones(int(np.sum(self.interior_wall_mask)), dtype=bool),
+    )
+
+  def apply_longwave_interior_radiative_heat_transfer_linearized(
+      self, temperature_estimates: np.ndarray
+  ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Returns the interior longwave exchange split for an implicit solver.
+
+    The same exchange apply_longwave_interior_radiative_heat_transfer returns,
+    written as a coefficient on the surface's own temperature plus a driving
+    flux from the rest of the enclosure. A solver that puts the coefficient on
+    its diagonal keeps the balance diagonally dominant, which the explicit
+    form does not; see linearized_radiative_exchange for why that matters and
+    why it does not move the converged answer.
+
+    Only interior wall nodes may use the implicit form, which is what the
+    third return value marks. An interior mass node radiates at its mass
+    temperature but deposits its flux into the air CV sharing its coordinates,
+    so its own temperature is not the unknown that CV's balance solves for and
+    its exchange has to stay explicit.
+
+    Args:
+      temperature_estimates: Current air CV temperature estimates.
+
+    Returns:
+      Three 1-D arrays in lwx_index order: the exchange coefficient [W/m^2/K],
+      the driving flux [W/m^2], and a boolean marking the interior wall nodes.
+      For any node, driving - coefficient * T is that node's net radiative
+      heat flux, so a caller can recover the explicit form where it has to.
+    """
+    enclosure_temperatures, is_wall_node = (
+        self._longwave_enclosure_temperatures(temperature_estimates)
+    )
+    coefficient, driving = (
+        building_radiation_utils.linearized_radiative_exchange(
+            enclosure_temperatures, self.ifa_inv
+        )
+    )
+    return coefficient, driving, is_wall_node

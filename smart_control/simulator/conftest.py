@@ -34,7 +34,7 @@ FLOOR_PLAN = np.array([
 
 
 def create_building_with_radiative_properties(
-    view_factor_method: str = "ScriptF",
+    view_factor_method: str = "AreaRatio",
     include_interior_mass: bool = False,
     floor_plan: np.array = FLOOR_PLAN,
     initial_temp: float = 292.0,

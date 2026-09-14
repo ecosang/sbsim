@@ -17,6 +17,7 @@ import pandas as pd
 import tensorflow as tf
 
 from smart_control.simulator import building as building_py
+from smart_control.simulator import constants
 from smart_control.simulator import hvac_floorplan_based as hvac_py
 from smart_control.simulator import simulator_flexible_floor_plan as simulator
 from smart_control.simulator import weather_controller as weather_controller_py
@@ -557,6 +558,22 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
 
     # interior mass addition
     self.include_interior_mass = building.include_interior_mass
+
+    # Which nodes of the radiating enclosure are interior walls, in the order
+    # _get_input_tensors stacks them. Wall nodes are the unknown their own CV
+    # solves for, mass nodes are not, so _get_longwave_grid_terms treats the
+    # two differently. The enclosure never changes shape, so this is built
+    # once.
+    if self.include_radiative_heat_transfer:
+      if self.include_interior_mass:
+        enclosure_mask = (
+            building.interior_wall_mask | building.interior_mass_mask
+        )
+        self._lwx_is_wall_node = building.interior_wall_mask[enclosure_mask]
+      else:
+        self._lwx_is_wall_node = np.ones(
+            int(np.sum(building.interior_wall_mask)), dtype=bool
+        )
     if self.include_interior_mass:
       self._initialize_interior_mass_tensors(building)
 
@@ -872,6 +889,118 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
 
       return (t_temp_left, t_temp_right, t_temp_above, t_temp_below)
 
+    def _get_longwave_grid_terms(
+        t_ifa_inv: tf.Tensor,
+        t_temp_interior_wall: tf.Tensor,
+        t_z: tf.Tensor,
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+      r"""Splits the interior longwave exchange into a diagonal and a source.
+
+      The net radiative gain of enclosure node $i$ is
+      $q_i = \sum_j M_{ij} \sigma (T_j^4 - T_i^4)$ with $M = -\text{ifa\_inv}$
+      off the diagonal. Because $a^4 - b^4 = (a^2 + b^2)(a + b)(a - b)$
+      exactly, this can be rewritten without approximating anything as
+
+      $$q_i = \sum_j M_{ij} h_{ij} (T_j - T_i), \quad
+        h_{ij} = \sigma (T_i^2 + T_j^2)(T_i + T_j),$$
+
+      which separates into a term proportional to the CV's own unknown and a
+      term that is not. Moving the first onto the denominator instead of
+      leaving the whole of $q_i$ in the numerator is what makes the Picard
+      sweep stable: with $M_{ij} \ge 0$ and $h_{ij} > 0$ the added diagonal is
+      exactly the sum of the added numerator weights, so the update stays a
+      convex combination of temperatures and cannot run away. Left fully
+      explicit (as this used to be, via $\sigma\, \text{ifa\_inv} @ T^4$), the
+      same balance diverges to NaN at large time steps. The fixed point is
+      untouched, since
+      $T_i (d + \sum_j M_{ij} h_{ij}) = n + \sum_j M_{ij} h_{ij} T_j$ is just
+      $T_i d = n + q_i$ rearranged. $h_{ij}$ is the exact secant of
+      $\sigma T^4$ between the two temperatures; the textbook
+      $4 \sigma \bar{T}^3$ is its $T_i \to T_j$ limit.
+
+      The off-diagonal coupling stays lagged at the last iterate, evaluated
+      once per sweep like the rest of this method's inputs.
+
+      Args:
+        t_ifa_inv: inverse interior-surface radiation matrix, whose
+          off-diagonal entries give the pairwise exchange coefficients.
+        t_temp_interior_wall: enclosure temperatures [K] as a column, in the
+          order _get_input_tensors stacks them.
+        t_z: floor height $z$ [m].
+
+      Returns:
+        A pair of tensors shaped like the grid, both already multiplied by
+        the area the flux crosses. The first is the exchange coefficient
+        $A \sum_j M_{ij} h_{ij}$ [W/K] belonging on the denominator, the
+        second the driving power $A \sum_j M_{ij} h_{ij} T_j$ [W] belonging
+        in the numerator. Both are zero when radiative heat transfer is
+        switched off.
+      """
+      zeros = tf.zeros_like(self._t_u)
+      if not self.include_radiative_heat_transfer:
+        return zeros, zeros
+
+      sigma = tf.constant(constants.STEFAN_BOLTZMANN_CONSTANT, dtype=tf.float32)
+      t_exchange = tf.math.negative(
+          tf.linalg.set_diag(
+              t_ifa_inv, tf.zeros(tf.shape(t_ifa_inv)[0], dtype=tf.float32)
+          )
+      )
+      t_temps = tf.reshape(t_temp_interior_wall, [-1])
+      t_squares = tf.math.square(t_temps)
+      # h_ij over every pair at once. Both factors are symmetric outer sums,
+      # so the diagonal is harmless: t_exchange already has a zero there.
+      t_conductance = tf.math.scalar_mul(
+          sigma,
+          tf.math.multiply(
+              tf.math.add(t_squares[:, tf.newaxis], t_squares[tf.newaxis, :]),
+              tf.math.add(t_temps[:, tf.newaxis], t_temps[tf.newaxis, :]),
+          ),
+      )
+      t_weights = tf.math.multiply(t_exchange, t_conductance)
+      t_coefficient = tf.math.reduce_sum(t_weights, axis=1)
+      t_driving = tf.linalg.matvec(t_weights, t_temps)
+
+      # A mass node radiates at its own temperature but deposits its flux
+      # into the air CV sharing its coordinates, so T_i is not the unknown
+      # that CV solves for and its self term cannot move onto the
+      # denominator. Put it back into the source instead, which leaves that
+      # node exactly as explicit as it was before. Wall nodes are their own
+      # CV's unknown, so theirs moves.
+      t_is_wall = tf.constant(self._lwx_is_wall_node, dtype=tf.float32)
+      t_driving = tf.math.subtract(
+          t_driving,
+          tf.math.multiply(
+              tf.math.multiply(1.0 - t_is_wall, t_coefficient), t_temps
+          ),
+      )
+      t_coefficient = tf.math.multiply(t_is_wall, t_coefficient)
+
+      indices = tf.where(self.building.lwx_index >= 0)
+      nodes = self.building.lwx_index[self.building.lwx_index >= 0]
+      # Both terms are fluxes per unit area, so they only enter the balance
+      # once multiplied by the area they cross. An edge CV exposes one full
+      # face and a corner CV two half faces, so either way the exposed area
+      # is delta_x * z. The iterative simulator already does this; without it
+      # the two solvers disagree by that factor.
+      area = (
+          tf.constant(self.building.cv_size_cm / 100.0, dtype=tf.float32) * t_z
+      )
+      return (
+          tf.scalar_mul(
+              area,
+              tf.tensor_scatter_nd_update(
+                  zeros, indices, tf.gather(t_coefficient, nodes)
+              ),
+          ),
+          tf.scalar_mul(
+              area,
+              tf.tensor_scatter_nd_update(
+                  zeros, indices, tf.gather(t_driving, nodes)
+              ),
+          ),
+      )
+
     def _get_denominator(
         t_k1_div_u: tf.Tensor,
         t_k3_div_u: tf.Tensor,
@@ -887,8 +1016,15 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
         t_heat_capacity: tf.Tensor,
         t_z: tf.Tensor,
         t_delta_t: tf.Tensor,
+        t_lwx_coefficient: tf.Tensor,
     ) -> tf.Tensor:
-      """Returns the denominator matrix from Eqn 22 as a tensor."""
+      """Returns the denominator matrix from Eqn 22 as a tensor.
+
+      Args:
+        t_lwx_coefficient: the radiative exchange coefficient
+          $A \\sum_j M_{ij} h_{ij}$ [W/K] from _get_longwave_grid_terms,
+          already area-weighted and zero away from interior walls.
+      """
 
       # Compute conductivity/conduction transfer terms on the v-z surface.
       dt1 = tf.math.add(t_k1_div_u, t_k3_div_u)
@@ -920,6 +1056,9 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
       t_denom = tf.math.add(dt1, dt2)
       t_denom = tf.math.add(t_denom, dt3)
       t_denom = tf.math.add(t_denom, dt4)
+      # Radiative self term that _get_longwave_grid_terms moved off the
+      # numerator.
+      t_denom = tf.math.add(t_denom, t_lwx_coefficient)
       return t_denom
 
     def _get_numerator(
@@ -944,11 +1083,16 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
         t_temp_inf: tf.Tensor,
         t_input_q: tf.Tensor,
         t_temp_minus: tf.Tensor,
-        t_ifa_inv: tf.Tensor,
-        t_temp_interior_wall: tf.Tensor,
+        t_lwx_driving: tf.Tensor,
         t_temp_mass: tf.Tensor,
     ) -> tf.Tensor:
-      """Returns the numerator matrix from Eqn 22 as a tensor."""
+      """Returns the numerator matrix from Eqn 22 as a tensor.
+
+      Args:
+        t_lwx_driving: the radiative driving power
+          $A \\sum_j M_{ij} h_{ij} T_j$ [W] from _get_longwave_grid_terms,
+          already area-weighted. Its counterpart sits on the denominator.
+      """
 
       # Compute numerator's conductivity transfer terms.
       t_k1_div_u_temp_left = tf.math.multiply(t_k1_div_u, t_temp_left)
@@ -983,26 +1127,12 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
       nt3 = tf.math.multiply(nt3, t_temp_minus)
       nt3 = tf.math.divide(nt3, t_delta_t)
 
-      # add ratdative heat transfer sigma*ifa_inv@(T-)^4
-      nt4 = tf.zeros_like(t_temp_minus)
-      if self.include_radiative_heat_transfer:
-        sigma = tf.constant(5.67e-8, dtype=tf.float32)
-        t_temp_interior_wall_4 = tf.math.pow(t_temp_interior_wall, 4)
-        # Ensure both tensors have the same dtype for matrix multiplication
-        nt4_temp = tf.linalg.matmul(t_ifa_inv, t_temp_interior_wall_4)
-        nt4_temp = tf.math.multiply(nt4_temp, sigma)
-
-        # Use tensor_scatter_nd_update to update specific indices
-        indices = tf.where(self.building.lwx_index >= 0)
-        # Extract the specific elements from nt4_temp and flatten to match nt4
-        # shape
-        updates = tf.gather(
-            tf.squeeze(
-                nt4_temp
-            ),  # Remove the extra dimension from [26,1] to [26]
-            self.building.lwx_index[self.building.lwx_index >= 0],
-        )
-        nt4 = tf.tensor_scatter_nd_update(nt4, indices, updates)
+      # The radiative exchange between the interior surfaces,
+      # sum_j M_ij h_ij T_j with M = -ifa_inv off the diagonal. Only the part
+      # that does not scale with the CV's own temperature is here; the rest
+      # is on the denominator. See _get_longwave_grid_terms for why the split
+      # is exact and why it is needed.
+      nt4 = t_lwx_driving
 
       # Add interior mass coupling term: K_mass * U * V / Z * T_mass
       nt5 = tf.zeros_like(t_temp_minus)
@@ -1067,6 +1197,13 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
     t_k2_div_v = tf.math.divide(self._t_conductivity_bottom_edge, self._t_v)
     t_k4_div_v = tf.math.divide(self._t_conductivity_top_edge, self._t_v)
 
+    # Radiation is split so that the part scaling with the CV's own unknown
+    # lands on the denominator and the rest stays a source. Both are
+    # evaluated at the current field, so the exchange itself is still lagged.
+    t_lwx_coefficient, t_lwx_driving = _get_longwave_grid_terms(
+        t_ifa_inv, t_temp_interior_wall, t_z
+    )
+
     t_denom = _get_denominator(
         t_k1_div_u,
         t_k3_div_u,
@@ -1082,6 +1219,7 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
         t_heat_capacity,
         t_z,
         t_delta_t,
+        t_lwx_coefficient,
     )
 
     # Calculate the numerator terms
@@ -1107,8 +1245,7 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
         t_temp_inf,
         t_input_q,
         t_temp_minus,
-        t_ifa_inv,
-        t_temp_interior_wall,
+        t_lwx_driving,
         t_temp_mass,
     )
 
