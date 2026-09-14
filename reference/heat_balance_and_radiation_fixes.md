@@ -262,6 +262,44 @@ EnergyPlus가 `CalcInteriorRadExchange`에서 쓰는 **쌍별 차분형**과 동
 $$q_i = \sigma \sum_{j\ne i} M_{ij}\,(T_j^4 - T_i^4),
 \qquad M = -\mathbf{ifa\_inv}\ \text{(대각을 0으로)}$$
 
+수정 전 (`building_radiation_utils.py::net_radiative_heatflux_function_of_t`)은
+$\mathbf{q}^{out} = \sigma\,\mathbf{ifa\_inv}\,\mathbf{E}_b$ (절대형)를 그대로 계산했다:
+
+```python
+q = sigma * ifa_inv @ np.power(T, 4)
+return q
+```
+
+수정 후는 대각을 0으로 만든 교환 행렬 $M$을 만들어 온도의 **네제곱 차이**에 곱한다.
+`exchange.sum(axis=1) * emissive_power` 항이 바로 $M_{ii}$ 자리에 있었을 "자기 자신과의 차이(=0)"를
+대신해서, 각 행이 실제로 무엇을 빼야 하는지를 명시적으로 계산해 준다:
+
+```python
+exchange = -np.array(ifa_inv, dtype=float)
+np.fill_diagonal(exchange, 0.0)
+emissive_power = sigma * np.power(np.asarray(T, dtype=float), 4)
+return exchange @ emissive_power - exchange.sum(axis=1) * emissive_power
+```
+
+`tf_simulator.py::_get_numerator`도 텐서 버전으로 정확히 같은 식을 계산한다 (`tf.linalg.set_diag`로
+대각을 0으로 만든 뒤 행렬곱과 행합을 뺀다):
+
+```python
+t_exchange = tf.math.negative(
+    tf.linalg.set_diag(
+        t_ifa_inv, tf.zeros(tf.shape(t_ifa_inv)[0], dtype=tf.float32)
+    )
+)
+nt4_temp = tf.math.subtract(
+    tf.linalg.matmul(t_exchange, t_temp_interior_wall_4),
+    tf.math.multiply(
+        tf.math.reduce_sum(t_exchange, axis=1, keepdims=True),
+        t_temp_interior_wall_4,
+    ),
+)
+nt4_temp = tf.math.multiply(nt4_temp, sigma)
+```
+
 이 형태의 성질:
 
 1. **균일 온도에서 항등적으로 0**이다. 형상계수 품질과 무관하다.
@@ -314,6 +352,52 @@ $$\max_i \Big|\sum_j F_{ij} - 1\Big|$$
 | 행합 범위            | 0.71 ~ 2.17 | 0.7604 ~ 1.4600 |
 | 최악의 \|행합 − 1\|  |       1.169 |       **0.460** |
 | $\max\|F - F^\top\|$ |      0.0286 |           **0** |
+
+수정 전에는 진입 시점과 반복 루프 안 양쪽에서 전체 합 하나로만 판정했다:
+
+```python
+# 진입 시점 (이미 만족되어 있어 아무 의미가 없었다)
+results['original_check_value'] = abs(np.sum(F) - N)
+...
+# 반복 루프 안
+ConvrgNew = abs(np.sum(FixedF) - N)
+```
+
+수정 후는 두 곳 다 "가장 나쁜 행"으로 바꿨다:
+
+```python
+# 진입 시점: 보고용으로만 남기고 판정에는 쓰지 않는다
+original_row_closure = np.max(np.abs(np.sum(F, axis=0) - 1.0))
+...
+# 반복 루프 안: 실제 수렴 판정 기준
+ConvrgNew = np.max(np.abs(np.sum(FixedF, axis=0) - 1.0))
+```
+
+또한 수정 전에는 "고친 행렬이 원본보다 나을 때만" 채택하는 조건문이 있었는데, 원본의 초기 오차가 이미 0에 가까워 이 조건이 사실상 항상
+거짓이 되어 **비상호적 원본 행렬**이 그대로 반환되는 부작용이 있었다:
+
+```python
+# 수정 전: 개선되지 않으면 상호성 없는 원본을 반환해버렸다
+if results['fixed_check_value'] < results['original_check_value']:
+    F[:] = FixedF
+    results['final_check_value'] = results['fixed_check_value']
+else:
+    results['final_check_value'] = results['original_check_value']
+    results['row_sum'] = np.sum(FixedF)
+    if abs(results['row_sum'] - N) < PRIMARY_CONVERGENCE:
+        F[:] = FixedF
+        results['final_check_value'] = results['fixed_check_value']
+```
+
+수정 후는 상호적인 행렬을 조건 없이 채택한다 (§6 덕분에 폐합이 아니라 상호성이 보존을 보장하므로):
+
+```python
+# 수정 후: 상호성이 보존을 보장하므로 항상 보정 행렬을 채택한다
+results['fixed_check_value'] = ConvrgNew
+results['row_sum'] = np.sum(FixedF)
+F[:] = FixedF
+results['final_check_value'] = ConvrgNew
+```
 
 ### 왜 0이 아니라 0.46에서 멈추는가
 
