@@ -782,22 +782,23 @@ class FloorPlanBasedBuilding(BaseSimulatorBuilding):
     interior_wall_index: matrix representing the index of the interior
       walls of the building. Used only for calculating interior radiative
       heat transfer.
-    interior_wall_vf: matrix representing the view factors of the
-      interior walls of the building, which is denoted as F in the equation.
-      Used only for calculating interior radiative heat transfer.
+    interior_wall_vf: Global view-factor matrix, or None when enclosure
+      partitioning is enabled. Per-enclosure matrices are stored in
+      interior_wall_vf_by_enclosure.
     epsilon: matrix representing the emissivity of the nodes of
       the building. Used only for calculating radiative heat transfer.
     alpha: matrix representing the absorptivity of the nodes of
       the building. Used only for calculating radiative heat transfer.
     tau: matrix representing the transmittance of the nodes of
       the building. Used only for calculating radiative heat transfer.
-    ifa_inv: matrix representing the inverse of the IFA matrix of the nodes of
-      the building. Used only for calculating radiative heat transfer.
+    ifa_inv: Global $(I-F)\tilde{A}^{-1}$ operator, or None when enclosure
+      partitioning is enabled. Per-enclosure operators are stored in
+      ifa_inv_by_enclosure.
     include_interior_mass: bool to note whether to include interior mass nodes.
     interior_mass_mask: matrix indicating which CVs have interior mass nodes.
     interior_mass_temp: matrix representing temperature of interior mass nodes.
 
-      The longwave radiation ($q_{lwx}$) is calculated as:
+      The outward longwave radiation operator is:
 
       $$q_{lwx} = \\sigma(I-F)\\tilde{A}_{inv}T^4$$
 
@@ -829,8 +830,9 @@ class FloorPlanBasedBuilding(BaseSimulatorBuilding):
       building_exterior_radiative_properties: RadiationProperties | None = None,
       interior_mass_radiative_properties: RadiationProperties | None = None,
       include_radiative_heat_transfer: bool = False,
-      view_factor_method: str = "ScriptF",
+      view_factor_method: str = "AreaRatio",
       include_interior_mass: bool = False,
+      partition_radiative_enclosures: bool = False,
   ):
     """Initializes the New Building.
 
@@ -863,9 +865,18 @@ class FloorPlanBasedBuilding(BaseSimulatorBuilding):
       include_radiative_heat_transfer: bool to note whether to include radiative
         heat transfer.
       view_factor_method: str to note the method to use for view factors.
-        Either "ScriptF" or "CarrollMRT". See
+        Either "AreaRatio" (default, area weighted over the connected air
+        space, as in EnergyPlus), "ScriptF" (area weighted but restricted to
+        surfaces in an unblocked line of sight) or "CarrollMRT". See
+        `building_radiation_utils.get_vf` for the trade-off between the first
+        two, and
         [LW Radiation Exchange Among Zone Surfaces](https://bigladdersoftware.com/epx/docs/9-6/engineering-reference/inside-heat-balance.html#lw-radiation-exchange-among-zone-surfaces)
         for more details.
+      partition_radiative_enclosures: If true, construct and evaluate one view
+        factor and IFA matrix per disconnected radiative enclosure instead of
+        allocating one matrix over every radiating node. Defaults to false for
+        compatibility with callers that inspect `interior_wall_vf` or
+        `ifa_inv` directly.
       interior_mass_properties: MaterialProperties for interior mass nodes
         attached to air CVs.
       interior_mass_radiative_properties: RadiationProperties for interior mass
@@ -880,6 +891,7 @@ class FloorPlanBasedBuilding(BaseSimulatorBuilding):
     self._convection_simulator = convection_simulator
     self._reset_temp_values = reset_temp_values
     self.include_radiative_heat_transfer = include_radiative_heat_transfer
+    self.partition_radiative_enclosures = partition_radiative_enclosures
     self.include_interior_mass = include_interior_mass
 
     # Apply default material properties if not provided
@@ -1039,12 +1051,18 @@ class FloorPlanBasedBuilding(BaseSimulatorBuilding):
       self.lwx_index[interior_wall_mask_all] = np.arange(
           np.sum(interior_wall_mask_all)
       )
-      self.interior_wall_vf = building_radiation_utils.get_vf(
-          indexed_floor_plan=self.indexed_floor_plan,
-          interior_wall_mask=self.interior_wall_mask,
-          view_factor_method=view_factor_method,
-          interior_mass_mask=self.interior_mass_mask,
-      )
+      if self.partition_radiative_enclosures:
+        self.radiative_enclosure_indices = (
+            building_radiation_utils.get_radiative_enclosure_indices(
+                self.indexed_floor_plan,
+                self.interior_wall_mask,
+                self.interior_mass_mask if self.include_interior_mass else None,
+            )
+        )
+      else:
+        self.radiative_enclosure_indices = (
+            np.arange(int(np.sum(interior_wall_mask_all))),
+        )
 
       # radiative properties
       inside_wall_radiative_properties = (
@@ -1096,12 +1114,51 @@ class FloorPlanBasedBuilding(BaseSimulatorBuilding):
         epsilon_vector = epsilon_temp[interior_mask_all]
       else:
         epsilon_vector = self._epsilon[self.interior_wall_mask]
-      a_tilde_inv = building_radiation_utils.calculate_a_tilde_inv(
-          epsilon_vector, self.interior_wall_vf
-      )
-      self.ifa_inv = building_radiation_utils.calculate_ifa_inv(
-          self.interior_wall_vf, a_tilde_inv
-      )
+      if self.partition_radiative_enclosures:
+        view_factor_blocks = []
+        ifa_blocks = []
+        for enclosure_indices in self.radiative_enclosure_indices:
+          enclosure_mask = np.isin(self.lwx_index, enclosure_indices)
+          enclosure_wall_mask = self.interior_wall_mask & enclosure_mask
+          enclosure_mass_mask = None
+          if self.include_interior_mass:
+            enclosure_mass_mask = self.interior_mass_mask & enclosure_mask
+          view_factors = building_radiation_utils.get_vf(
+              indexed_floor_plan=self.indexed_floor_plan,
+              interior_wall_mask=enclosure_wall_mask,
+              view_factor_method=view_factor_method,
+              interior_mass_mask=enclosure_mass_mask,
+          )
+          a_tilde_inv = building_radiation_utils.calculate_a_tilde_inv(
+              epsilon_vector[enclosure_indices], view_factors
+          )
+          view_factor_blocks.append(view_factors)
+          ifa_blocks.append(
+              building_radiation_utils.calculate_ifa_inv(
+                  view_factors, a_tilde_inv
+              )
+          )
+        self.interior_wall_vf = None
+        self.ifa_inv = None
+        self.interior_wall_vf_by_enclosure = tuple(view_factor_blocks)
+        self.ifa_inv_by_enclosure = tuple(ifa_blocks)
+      else:
+        self.interior_wall_vf = building_radiation_utils.get_vf(
+            indexed_floor_plan=self.indexed_floor_plan,
+            interior_wall_mask=self.interior_wall_mask,
+            view_factor_method=view_factor_method,
+            interior_mass_mask=(
+                self.interior_mass_mask if self.include_interior_mass else None
+            ),
+        )
+        a_tilde_inv = building_radiation_utils.calculate_a_tilde_inv(
+            epsilon_vector, self.interior_wall_vf
+        )
+        self.ifa_inv = building_radiation_utils.calculate_ifa_inv(
+            self.interior_wall_vf, a_tilde_inv
+        )
+        self.interior_wall_vf_by_enclosure = (self.interior_wall_vf,)
+        self.ifa_inv_by_enclosure = (self.ifa_inv,)
 
     else:
       self.view_factor_method = None
@@ -1109,10 +1166,13 @@ class FloorPlanBasedBuilding(BaseSimulatorBuilding):
       self.interior_wall_mask = None
       self.interior_wall_index = None
       self.interior_wall_vf = None
+      self.interior_wall_vf_by_enclosure = ()
+      self.radiative_enclosure_indices = ()
       self._alpha = None
       self._epsilon = None
       self._tau = None
       self.ifa_inv = None
+      self.ifa_inv_by_enclosure = ()
 
   def _assign_interior_mass_properties(
       self,
@@ -1338,23 +1398,116 @@ class FloorPlanBasedBuilding(BaseSimulatorBuilding):
     """
     Applies long-wave interior radiative heat transfer.
 
-    This function calculates the net radiative heat flux and radiosity for each
-    interior wall.
+    This function calculates the net radiative heat flux gained by each
+    interior wall or mass node. It does not return radiosity separately.
+
+    Returns the exchange explicitly, evaluated at the temperatures passed in.
+    get_longwave_interior_radiative_exchange_terms returns the same exchange
+    split so that a solver can carry part of it implicitly.
+    """
+    enclosure_temperatures, _ = self._longwave_enclosure_temperatures(
+        temperature_estimates
+    )
+    heat_flux = np.zeros_like(enclosure_temperatures, dtype=float)
+    for enclosure_indices, ifa_inv in zip(
+        self.radiative_enclosure_indices, self.ifa_inv_by_enclosure
+    ):
+      heat_flux[enclosure_indices] = (
+          building_radiation_utils.net_radiative_heatflux_function_of_t(
+              enclosure_temperatures[enclosure_indices], ifa_inv
+          )
+      )
+    return heat_flux
+
+  def _longwave_enclosure_temperatures(
+      self, temperature_estimates: np.ndarray
+  ) -> tuple[np.ndarray, np.ndarray]:
+    """Returns the enclosure's temperatures and which of its nodes are walls.
+
+    All radiative nodes are indexed globally by lwx_index, even when their
+    matrices are partitioned by enclosure. An interior wall node radiates at
+    the air CV temperature sitting on it, and an interior mass node radiates
+    at its own mass temperature; the two masks are disjoint.
+
+    Args:
+      temperature_estimates: Current air CV temperature estimates.
+
+    Returns:
+      A pair of 1-D arrays in lwx_index order: the temperature of every node
+      of the enclosure, and a boolean saying whether that node is an interior
+      wall rather than an interior mass node.
     """
     if self.include_interior_mass:
       interior_mask_all = self.interior_mass_mask | self.interior_wall_mask
-      temperature_estimates_temp = np.zeros_like(temperature_estimates)
-      temperature_estimates_temp[self.interior_mass_mask] = (
-          self.interior_mass_temp[self.interior_mass_mask]
+      enclosure_temperatures = np.zeros_like(temperature_estimates)
+      enclosure_temperatures[self.interior_mass_mask] = self.interior_mass_temp[
+          self.interior_mass_mask
+      ]
+      enclosure_temperatures[self.interior_wall_mask] = temperature_estimates[
+          self.interior_wall_mask
+      ]
+      return (
+          enclosure_temperatures[interior_mask_all],
+          self.interior_wall_mask[interior_mask_all],
       )
-      temperature_estimates_temp[self.interior_wall_mask] = (
-          temperature_estimates[self.interior_wall_mask]
+    return (
+        temperature_estimates[self.interior_wall_mask],
+        np.ones(int(np.sum(self.interior_wall_mask)), dtype=bool),
+    )
+
+  def get_longwave_interior_radiative_exchange_terms(
+      self, temperature_estimates: np.ndarray
+  ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    r"""Returns the interior longwave exchange split for an implicit solver.
+
+    The same exchange apply_longwave_interior_radiative_heat_transfer returns,
+    written as a coefficient on the surface's own temperature plus a driving
+    flux from the rest of the enclosure. A solver that puts the coefficient on
+    its diagonal keeps the balance diagonally dominant, which the explicit
+    form does not; see calculate_radiative_exchange_terms for why that matters
+    and why it does not move the converged answer.
+
+    Only interior wall nodes may use the implicit form, which is what the
+    third return value marks. An interior mass node radiates at its mass
+    temperature but deposits its flux into the air CV sharing its coordinates,
+    so its own temperature is not the unknown that CV's balance solves for and
+    its exchange has to stay explicit.
+
+    For each enclosure $e$, `calculate_radiative_exchange_terms` returns the
+    vectors $(\mathbf{c}_e, \mathbf{g}_e)$ satisfying
+
+    $$\mathbf{q}_e
+      = \mathbf{g}_e-\mathbf{c}_e\odot\mathbf{T}_e.$$
+
+    This method places every $\mathbf{c}_e$ and $\mathbf{g}_e$ back into global
+    ``lwx_index`` order using that enclosure's index vector. The returned
+    arrays therefore contain the concatenated enclosure results without
+    requiring equal enclosure sizes or padding.
+
+    Args:
+      temperature_estimates: Current air CV temperature estimates.
+
+    Returns:
+      Three 1-D arrays in lwx_index order: the exchange coefficient [W/m^2/K],
+      the driving flux [W/m^2], and a boolean marking the interior wall nodes.
+      These are the global assemblies of the per-enclosure
+      $(\mathbf{c}_e, \mathbf{g}_e)$ vectors. For any node,
+      ``driving - coefficient * T`` is its net radiative heat flux, so a caller
+      can recover the explicit form where it has to.
+    """
+    enclosure_temperatures, is_wall_node = (
+        self._longwave_enclosure_temperatures(temperature_estimates)
+    )
+    coefficient = np.zeros_like(enclosure_temperatures, dtype=float)
+    driving = np.zeros_like(enclosure_temperatures, dtype=float)
+    for enclosure_indices, ifa_inv in zip(
+        self.radiative_enclosure_indices, self.ifa_inv_by_enclosure
+    ):
+      enclosure_coefficient, enclosure_driving = (
+          building_radiation_utils.calculate_radiative_exchange_terms(
+              enclosure_temperatures[enclosure_indices], ifa_inv
+          )
       )
-      q_lwx = building_radiation_utils.net_radiative_heatflux_function_of_t(
-          temperature_estimates_temp[interior_mask_all], self.ifa_inv
-      )
-    else:
-      q_lwx = building_radiation_utils.net_radiative_heatflux_function_of_t(
-          temperature_estimates[self.interior_wall_mask], self.ifa_inv
-      )
-    return q_lwx
+      coefficient[enclosure_indices] = enclosure_coefficient
+      driving[enclosure_indices] = enclosure_driving
+    return coefficient, driving, is_wall_node

@@ -1591,8 +1591,8 @@ class FlexibleFloorplanSimulatorTest(parameterized.TestCase):
     )
     time_step_sec = 300.0
     hvac = self._create_small_hvac()
-    convergence_threshold = 0.1
-    iteration_limit = 100
+    convergence_threshold = 0.0001
+    iteration_limit = 500
     iteration_warning = 10
     start_timestamp = pd.Timestamp("2012-12-21")
 
@@ -1613,7 +1613,7 @@ class FlexibleFloorplanSimulatorTest(parameterized.TestCase):
     )
 
     converged = simulator.finite_differences_timestep(
-        ambient_temperature=292, convection_coefficient=12.0
+        ambient_temperature=300, convection_coefficient=12.0
     )
 
     self.assertTrue(
@@ -1632,7 +1632,7 @@ class FlexibleFloorplanSimulatorTest(parameterized.TestCase):
     )
     time_step_sec = 300.0
     hvac = self._create_small_hvac()
-    convergence_threshold = 0.1
+    convergence_threshold = 0.0001
     iteration_limit = 100
     iteration_warning = 10
     start_timestamp = pd.Timestamp("2012-12-21")
@@ -1667,7 +1667,7 @@ class FlexibleFloorplanSimulatorTest(parameterized.TestCase):
     )
 
     converged = simulator.finite_differences_timestep(
-        ambient_temperature=292, convection_coefficient=12.0
+        ambient_temperature=300, convection_coefficient=12.0
     )
 
     self.assertTrue(

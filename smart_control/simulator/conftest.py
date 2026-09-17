@@ -32,10 +32,24 @@ FLOOR_PLAN = np.array([
     [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
 ])
 
+TWO_ENCLOSURE_FLOOR_PLAN = np.array([
+    [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+    [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2],
+    [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2],
+    [2, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 2],
+    [2, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 2],
+    [2, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 2],
+    [2, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 2],
+    [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2],
+    [2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2],
+    [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+])
+
 
 def create_building_with_radiative_properties(
-    view_factor_method: str = "ScriptF",
+    view_factor_method: str = "AreaRatio",
     include_interior_mass: bool = False,
+    partition_radiative_enclosures: bool = False,
     floor_plan: np.array = FLOOR_PLAN,
     initial_temp: float = 292.0,
     cv_size_cm: float = 20.0,
@@ -88,4 +102,5 @@ def create_building_with_radiative_properties(
       view_factor_method=view_factor_method,
       interior_mass_properties=interior_mass_properties,
       include_interior_mass=include_interior_mass,
+      partition_radiative_enclosures=partition_radiative_enclosures,
   )

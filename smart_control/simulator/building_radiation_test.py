@@ -107,5 +107,72 @@ class BuildingRadiationScriptFTest(absltest.TestCase):
       )
 
 
+class PartitionedRadiativeEnclosureTest(absltest.TestCase):
+
+  def test_partitioned_and_full_area_ratio_operators_match(self):
+    """Enclosure blocks reproduce the full matrix without allocating it."""
+    for include_interior_mass in (False, True):
+      with self.subTest(include_interior_mass=include_interior_mass):
+        full = conftest.create_building_with_radiative_properties(
+            floor_plan=conftest.TWO_ENCLOSURE_FLOOR_PLAN,
+            include_interior_mass=include_interior_mass,
+        )
+        partitioned = conftest.create_building_with_radiative_properties(
+            floor_plan=conftest.TWO_ENCLOSURE_FLOOR_PLAN,
+            include_interior_mass=include_interior_mass,
+            partition_radiative_enclosures=True,
+        )
+
+        self.assertLen(partitioned.radiative_enclosure_indices, 2)
+        self.assertIsNone(partitioned.interior_wall_vf)
+        self.assertIsNone(partitioned.ifa_inv)
+
+        node_count = full.ifa_inv.shape[0]
+        assembled_ifa = np.zeros_like(full.ifa_inv)
+        assembled_vf = np.zeros_like(full.interior_wall_vf)
+        for indices, view_factors, ifa_inv in zip(
+            partitioned.radiative_enclosure_indices,
+            partitioned.interior_wall_vf_by_enclosure,
+            partitioned.ifa_inv_by_enclosure,
+        ):
+          assembled_ifa[np.ix_(indices, indices)] = ifa_inv
+          assembled_vf[np.ix_(indices, indices)] = view_factors
+
+        np.testing.assert_allclose(assembled_vf, full.interior_wall_vf)
+        np.testing.assert_allclose(assembled_ifa, full.ifa_inv, atol=1e-12)
+        self.assertLess(
+            sum(block.size for block in partitioned.ifa_inv_by_enclosure),
+            node_count**2,
+        )
+
+        temperatures = 285.0 + np.arange(full.temp.size).reshape(
+            full.temp.shape
+        )
+        if include_interior_mass:
+          mass_temperatures = 290.0 + np.arange(full.temp.size).reshape(
+              full.temp.shape
+          )
+          full.interior_mass_temp[:] = mass_temperatures
+          partitioned.interior_mass_temp[:] = mass_temperatures
+
+        np.testing.assert_allclose(
+            partitioned.apply_longwave_interior_radiative_heat_transfer(
+                temperatures
+            ),
+            full.apply_longwave_interior_radiative_heat_transfer(temperatures),
+            atol=1e-10,
+        )
+        partitioned_terms = (
+            partitioned.get_longwave_interior_radiative_exchange_terms(
+                temperatures
+            )
+        )
+        full_terms = full.get_longwave_interior_radiative_exchange_terms(
+            temperatures
+        )
+        for partitioned_term, full_term in zip(partitioned_terms, full_terms):
+          np.testing.assert_allclose(partitioned_term, full_term, atol=1e-10)
+
+
 if __name__ == "__main__":
   absltest.main()

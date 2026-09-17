@@ -77,20 +77,43 @@ def calculate_a_tilde_inv(epsilon: np.ndarray, F: np.ndarray) -> np.ndarray:
 
 
 def calculate_ifa_inv(F: np.ndarray, A_inv: np.ndarray) -> np.ndarray:
-  r"""
-  Calculates the $IFA_{inv}$ matrix.
+  r"""Builds the operator mapping emissive power to net outward heat flux.
 
-  $$IFA_{inv} = (I - F) \tilde{A}^{-1}$$
+  With $\mathbf{J} = \tilde{\mathbf{A}}^{-1}\mathbf{E}_b$ and
+  $\mathbf{G} = \mathbf{F}\mathbf{J}$, the net radiative heat flux leaving
+  each surface is
 
-  See [`net_radiative_heatflux_function_of_T`][smart_control.simulator.building_radiation_utils.net_radiative_heatflux_function_of_t] for more details.
+  $$\mathbf{q}^{out} = \mathbf{J} - \mathbf{G}
+    = (\mathbf{I} - \mathbf{F})\tilde{\mathbf{A}}^{-1}\mathbf{E}_b.$$
+
+  This function returns the operator
+
+  $$\mathbf{IFA}_{inv} =
+    (\mathbf{I} - \mathbf{F})\tilde{\mathbf{A}}^{-1}.$$
+
+  Despite its historical name, $\mathbf{IFA}_{inv}$ is not itself a matrix
+  inverse. The input named ``A_inv`` must specifically be
+  $\tilde{\mathbf{A}}^{-1}$ from `calculate_a_tilde_inv`. ``F[i, j]`` follows
+  the same convention used there: it weights radiosity from surface $j$ in
+  irradiation on surface $i$.
+
+  For a complete enclosure, $\sum_j F_{ij}=1$, this operator has zero row sums
+  and therefore gives zero net flux at uniform temperature. Physical energy
+  conservation additionally requires area-weighted reciprocity,
+  $A_iF_{ij}=A_jF_{ji}$. The default equal-area ``AreaRatio`` factors satisfy
+  both conditions within each connected enclosure.
+
+  See `net_radiative_heatflux_function_of_t` for the pairwise form used to
+  return heat flux gained by a surface rather than heat flux leaving it.
 
   Args:
-      F (np.ndarray): The view factor matrix.
-      A_inv (np.ndarray): The A inverse matrix.
+    F: Square view-factor matrix.
+    A_inv: $\tilde{\mathbf{A}}^{-1}$ from `calculate_a_tilde_inv`.
 
   Returns:
-      IFA_inv : The IFA inverse matrix.
-  """  # pylint: disable=line-too-long
+    The matrix $(\mathbf{I}-\mathbf{F})\tilde{\mathbf{A}}^{-1}$, which maps
+    blackbody emissive power to net outward radiative heat flux.
+  """
 
   n = F.shape[0]
 
@@ -103,18 +126,18 @@ def net_radiative_heatflux_function_of_t(
     T: np.ndarray, ifa_inv: np.ndarray
 ) -> np.array:
   r"""
-  Calculates the net radiative heat flux and radiosity for all surfaces given
+  Calculates the net radiative heat flux gained by all surfaces given
     surface temperatures.
 
   Equations:
   --------------------
   The net radiative heat flux leaving surface $i$ is:
 
-  $$q_i = J_i - G_i$$
+  $$q^{out}_i = J_i - G_i$$
 
   where:
-  - $J_i$ is the radiosity (total outgoing radiative flux) from surface $i$,
-  - $G_i$ is the irradiation (total incoming radiative flux) onto surface $i$.
+  $J_i$ is the radiosity (total outgoing radiative flux) from surface $i$,
+  $G_i$ is the irradiation (total incoming radiative flux) onto surface $i$.
 
   The radiosity is given by:
 
@@ -122,7 +145,7 @@ def net_radiative_heatflux_function_of_t(
 
   where $\epsilon_i$ is the emissivity, $\rho_i = 1 - \epsilon_i$ is the
     reflectivity (for opaque surfaces), and $E_{b,i}$ is the blackbody
-    emission from $i$ surface.
+    emission from surface $i$.
 
   The irradiation for the $i$ surface is:
 
@@ -144,20 +167,87 @@ def net_radiative_heatflux_function_of_t(
 
   The net heat flux vector for all surfaces is:
 
-  $$\mathbf{q}=
-  (\mathbf{I}-\tilde{\mathbf{F}})\tilde{\mathbf{A}}^{-1}\mathbf{E}_b$$
+  $$\mathbf{q}^{out}=
+  (\mathbf{I}-\tilde{\mathbf{F}})\tilde{\mathbf{A}}^{-1}\mathbf{E}_b
+  = \mathbf{IFA}_{inv}\mathbf{E}_b$$
 
   where $\tilde{\mathbf{F}}$ is the matrix of view factors,
-    $F_{ij}$ and$\mathbf{E}_b$ is $\sigma \mathbf{T}^4$.
+    $F_{ij}$ and $\mathbf{E}_b$ is $\sigma \mathbf{T}^4$.
+
+  Pairwise (difference) form:
+  ---------------------------
+  The operator above returns flux leaving each surface. The energy balance uses
+  flux gained by each surface, so with
+
+  $$\mathbf{R} = \mathbf{IFA}_{inv}
+    = (\mathbf{I}-\mathbf{F})\tilde{\mathbf{A}}^{-1},$$
+
+  the required sign convention is
+
+  $$\mathbf{q}^{gain} = -\mathbf{q}^{out}
+    = -\mathbf{R}\mathbf{E}_b.$$
+
+  To convert this matrix product to a pairwise temperature-difference form,
+  assume the view factors satisfy enclosure closure,
+
+  $$\mathbf{F}\mathbf{1}=\mathbf{1}.$$
+
+  The definition of $\tilde{\mathbf{A}}$ then gives
+
+  $$\left[\tilde{\mathbf{A}}\mathbf{1}\right]_i
+    = \frac{1-(1-\epsilon_i)\sum_jF_{ij}}{\epsilon_i} = 1,$$
+
+  and therefore
+
+  $$\tilde{\mathbf{A}}^{-1}\mathbf{1}=\mathbf{1}, \qquad
+    \mathbf{R}\mathbf{1}
+    = (\mathbf{I}-\mathbf{F})\mathbf{1}=\mathbf{0}.$$
+
+  Thus every row of $\mathbf{R}$ sums to zero. Define the off-diagonal
+  exchange matrix by
+
+  $$M_{ij} = -R_{ij} \ge 0 \quad (i \neq j), \qquad
+    M_{ii} = 0,$$
+
+  so that the diagonal entry is
+
+  $$R_{ii} = -\sum_{j\neq i}R_{ij} = \sum_{j\neq i}M_{ij}.$$
+
+  Expanding the gained flux component by component gives
+
+  $$\begin{aligned}
+    q_i^{gain}
+    &= -\sum_jR_{ij}E_{b,j} \\
+    &= -R_{ii}E_{b,i} + \sum_{j\neq i}M_{ij}E_{b,j} \\
+    &= \sum_{j\neq i}M_{ij}(E_{b,j}-E_{b,i}) \\
+    &= \sum_{j\neq i}M_{ij}\,\sigma(T_j^4-T_i^4).
+  \end{aligned}$$
+
+  This is the pairwise form evaluated by the implementation. It is identically
+  zero at uniform temperature and preserves the hot-to-cold sign. It is exactly
+  equal to $-\mathbf{R}\mathbf{E}_b$ when the view-factor rows close to one.
+  If closure is not satisfied, the two forms differ by the residual row-sum
+  term; the pairwise form deliberately removes that artificial isothermal heat
+  source but cannot repair inaccurate exchange magnitudes.
+
+  This is also the form EnergyPlus uses in
+  ``CalcInteriorRadExchange``, where the self term of the exchange matrix is
+  zeroed and the sum is taken over $T_j^4 - T_i^4$.
+
+  The default ``AreaRatio`` method produces complete, reciprocal factors within
+  each connected enclosure under this model's equal-area surface assumption,
+  so the pairwise and absolute radiosity forms agree there.
 
   Nomenclature and Units:
   -----------------------
-  - $q_i$        : Net radiative heat flux from surface $i$ [$\mathrm{W/m^2}$]
+  - $q_i$        : Net radiative heat flux gained by surface $i$
+                    [$\mathrm{W/m^2}$]
   - $\mathbf{q}$ : Vector of $q_i$ for all $i=1..n$ [$\mathrm{W/m^2}$]
+  - $M_{ij}$     : Pairwise radiative exchange coefficient [dimensionless]
   - $J_i$        : Radiosity of surface $i$ [$\mathrm{W/m^2}$]
   - $\mathbf{J}$ : Vector of $J_i$ for all $i=1..n$ [$\mathrm{W/m^2}$]
   - $G_i$        : Irradiation on surface $i$ [$\mathrm{W/m^2}$]
-  - $E_{b,i}$    : Blackbody emissive power of surface $i$ [$\mathrm{W/m^2}$]$
+  - $E_{b,i}$    : Blackbody emissive power of surface $i$ [$\mathrm{W/m^2}$]
   - $\mathbf{E}_b$: Vector of $E_{b,i}$ for all $i=1..n$ [$\mathrm{W/m^2}$]
   - $\epsilon_i$ : Emissivity of surface $i$ [dimensionless]
   - $\rho_i$     : Reflectivity of surface $i$ [dimensionless],
@@ -182,15 +272,162 @@ def net_radiative_heatflux_function_of_t(
     ifa_inv (np.ndarray): (I - F) @ A_inv.
 
   Returns:
-      q : Net radiative heat flux [W/m^2]
+      np.ndarray : q, net radiative heat flux gained by each surface [W/m^2].
+        Positive means the surface is being heated by the rest of the enclosure.
 
   """
   sigma = (
       constants.STEFAN_BOLTZMANN_CONSTANT
   )  # [W/m^2K^4] Stefan-Boltzmann constant
 
-  q = sigma * ifa_inv @ np.power(T, 4)
-  return q
+  exchange = -np.array(ifa_inv, dtype=float)
+  np.fill_diagonal(exchange, 0.0)
+  emissive_power = sigma * np.power(np.asarray(T, dtype=float), 4)
+  return exchange @ emissive_power - exchange.sum(axis=1) * emissive_power
+
+
+def calculate_radiative_exchange_terms(
+    T: np.ndarray, ifa_inv: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+  r"""Calculates exact conductance-form radiative exchange terms.
+
+  Equations:
+  --------------------
+  The pairwise exchange that net_radiative_heatflux_function_of_t evaluates,
+
+  $$q_i = \sum_{j \neq i} M_{ij}\,\sigma\left(T_j^4 - T_i^4\right),$$
+
+  factors exactly. For any two temperatures,
+
+  $$\sigma\left(T_j^4 - T_i^4\right) =
+    \underbrace{\sigma\left(T_i^2 + T_j^2\right)\left(T_i + T_j\right)}_{h_{ij}}
+    \left(T_j - T_i\right),$$
+
+  which is an identity, not a linearization: $h_{ij}$ is the radiative
+  conductance [W/m^2/K] between the pair. The textbook $4\sigma\bar{T}^3$ is
+  what this collapses to as $T_i \to T_j$. Writing the exchange as
+
+  $$q_i = g_i-c_iT_i,$$
+
+  with
+
+  $$c_i = \sum_{j\neq i}M_{ij}h_{ij}, \qquad
+    g_i = \sum_{j\neq i}M_{ij}h_{ij}T_j.$$
+
+  Here $c_i$ is the exchange coefficient [W/m^2/K] belonging on the solver
+  diagonal, and $g_i$ is the driving flux [W/m^2] belonging in the source.
+
+  lets a solver carry the second term on the diagonal instead of lumping the
+  whole of $q_i$ into the source.
+
+  Why that matters:
+  -----------------
+  Write the non-radiative part of a control-volume balance as
+
+  $$D_i T_i = N_i + A_i q_i,$$
+
+  where $D_i > 0$ contains storage and transport terms multiplying the CV's
+  unknown temperature, $N_i$ contains their driving terms, and $A_i$ is the
+  radiating area. A fully explicit radiation update evaluates the complete
+  nonlinear flux at the previous iterate,
+
+  $$T_i^{(k+1)} = \frac{N_i + A_i q_i(\mathbf{T}^{(k)})}{D_i}.$$
+
+  For a hot surface, $q_i$ contains a large negative term proportional to
+  $-(T_i^{(k)})^4$, but that temperature does not appear in the denominator.
+  If the storage contribution to $D_i$ becomes small, as it does for a long
+  time step, the explicit correction can cross far past the surrounding
+  temperatures. The next iteration raises that overshoot to the fourth power,
+  which can alternate in sign, grow, and eventually overflow.
+
+  Substituting the exact split $q_i = g_i-c_iT_i$ instead gives the
+  semi-implicit Picard update
+
+  $$T_i^{(k+1)} =
+    \frac{N_i + A_i g_i(\mathbf{T}^{(k)})}
+         {D_i + A_i c_i(\mathbf{T}^{(k)})}.$$
+
+  Since $M_{ij} \ge 0$ and $h_{ij} > 0$, $c_i = \sum_jM_{ij}h_{ij}$ is
+  nonnegative and the radiation term adds positive diagonal damping. Its
+  numerator weights are the same $M_{ij}h_{ij}$ whose sum forms that diagonal,
+  so the radiation-only contribution is bounded by the temperatures driving
+  it instead of acting as an undamped fourth-power source. Other heat sources
+  may still move the complete CV update outside the neighboring-temperature
+  range, but radiation no longer causes the sign-flipping runaway described
+  above.
+
+  Because $q_i = g_i-c_iT_i$ is an exact identity, moving $c_iT_i$ to the
+  diagonal does not change the converged heat balance. Only the
+  temperature-dependent coefficients are lagged during iteration.
+
+  The function itself performs no approximation. A solver may use the returned
+  coefficient semi-implicitly while lagging its temperature dependence by one
+  iteration; that outer iteration is a Picard linearization of the nonlinear
+  balance and recovers the nonlinear answer at convergence.
+
+  Implementation:
+  ---------------
+  This function operates on one enclosure at a time. For enclosure $e$, let
+  $\mathbf{T}_e$ contain its $n_e$ surface temperatures and let
+  $\mathbf{M}_e$ be ``-ifa_inv`` with a zero diagonal. The returned vectors are
+  $\mathbf{c}_e$ and $\mathbf{g}_e$, whose entries are the $c_i$ and $g_i$
+  defined above for nodes in that enclosure.
+
+  Expanding $h_{ij}$ avoids materializing an $n_e \times n_e$
+  pair-temperature array. Define
+
+  $$\mathbf{s}_{e,k} = \mathbf{M}_e\mathbf{T}_e^k,
+    \qquad k=0,1,2,3,4,$$
+
+  where $\mathbf{T}_e^0$ is the all-ones vector. Then
+
+  $$\mathbf{c}_e = \sigma(\mathbf{T}_e^3\odot\mathbf{s}_{e,0}
+    + \mathbf{T}_e^2\odot\mathbf{s}_{e,1}
+    + \mathbf{T}_e\odot\mathbf{s}_{e,2} + \mathbf{s}_{e,3}),$$
+
+  $$\mathbf{g}_e = \sigma(\mathbf{T}_e^3\odot\mathbf{s}_{e,1}
+    + \mathbf{T}_e^2\odot\mathbf{s}_{e,2}
+    + \mathbf{T}_e\odot\mathbf{s}_{e,3} + \mathbf{s}_{e,4}).$$
+
+  Thus one matrix multiplication with five right-hand sides produces both
+  outputs. This keeps intermediate storage linear in enclosure size and works
+  directly with variable-size enclosure blocks; no padded 3-D batch is needed.
+
+  Args:
+    T: Surface temperatures in Kelvin, one per node of the enclosure.
+    ifa_inv: (I - F) @ A_inv, as built by calculate_ifa_inv.
+
+  Returns:
+    The enclosure vectors $(\mathbf{c}_e, \mathbf{g}_e)$, both shaped like
+    ``T``. $\mathbf{c}_e$ is the exchange coefficient [W/m^2/K] belonging on
+    the diagonal, and $\mathbf{g}_e$ is the driving flux [W/m^2] belonging in
+    the source. Their combination
+    $\mathbf{g}_e-\mathbf{c}_e\odot\mathbf{T}_e$ reproduces
+    `net_radiative_heatflux_function_of_t` exactly.
+  """
+  sigma = (
+      constants.STEFAN_BOLTZMANN_CONSTANT
+  )  # [W/m^2K^4] Stefan-Boltzmann constant
+
+  exchange = -np.array(ifa_inv, dtype=float)
+  np.fill_diagonal(exchange, 0.0)
+
+  temperatures = np.asarray(T, dtype=float)
+  squared = np.square(temperatures)
+  cubed = squared * temperatures
+  fourth_power = squared * squared
+  powers = np.column_stack(
+      (np.ones_like(temperatures), temperatures, squared, cubed, fourth_power)
+  )
+  moment_0, moment_1, moment_2, moment_3, moment_4 = (exchange @ powers).T
+
+  coefficient = sigma * (
+      cubed * moment_0 + squared * moment_1 + temperatures * moment_2 + moment_3
+  )
+  driving = sigma * (
+      cubed * moment_1 + squared * moment_2 + temperatures * moment_3 + moment_4
+  )
+  return coefficient, driving
 
 
 def mark_air_connected_interior_walls(
@@ -199,6 +436,8 @@ def mark_air_connected_interior_walls(
     interior_wall_value: int = constants.INTERIOR_WALL_VALUE_IN_FUNCTION,
     marked_value: int = TEMPORARY_MARKED_VALUE,
     air_value: int = constants.INTERIOR_SPACE_VALUE_IN_FUNCTION,
+    also_mark_air: bool = False,
+    air_marked_value: int = AIR_IN_LINE_OF_SIGHT,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
   """
   Mark all interior wall nodes that are connected to the same air space as the
@@ -220,6 +459,13 @@ def mark_air_connected_interior_walls(
         Only used internally. Defaults to -33.
     air_value (int, optional): Value used to represent air spaces in the floor
         plan. Defaults to 0 (from "constants.py").
+    also_mark_air (bool, optional): If True, the connected air cells are also
+        marked, with `air_marked_value`, in `modified_floor_plan`. The extracted
+        `interior_space_array` is unaffected. Callers that place nodes on air
+        cells, such as interior mass, use this to recover the whole enclosure
+        without a line-of-sight sweep. Defaults to False.
+    air_marked_value (int, optional): Value used to mark the connected air cells
+        when `also_mark_air` is True. Defaults to 9 (`AIR_IN_LINE_OF_SIGHT`).
 
   Returns:
     A tuple containing:
@@ -326,6 +572,12 @@ def mark_air_connected_interior_walls(
   if start_cell_value == interior_wall_value and walls_to_mark:
     floor_plan[start_row, start_col] = marked_value
 
+  # Optionally mark the air cells themselves, so a caller can read the whole
+  # enclosure, walls and air, straight off the returned floor plan.
+  if also_mark_air:
+    for air_row, air_col in connected_air_cells:
+      floor_plan[air_row, air_col] = air_marked_value
+
   # Create interior space array containing only air and marked walls
   all_interior_positions = connected_air_cells.union(walls_to_mark)
   if not all_interior_positions:
@@ -356,6 +608,82 @@ def mark_air_connected_interior_walls(
   return floor_plan, interior_space
 
 
+def get_radiative_enclosure_indices(
+    indexed_floor_plan: np.ndarray,
+    interior_wall_mask: np.ndarray,
+    interior_mass_mask: np.ndarray | None = None,
+    marked_value: int = TEMPORARY_MARKED_VALUE,
+    interior_mass_value: int = AIR_IN_LINE_OF_SIGHT,
+) -> tuple[np.ndarray, ...]:
+  """Partitions radiating nodes into disconnected enclosure index blocks.
+
+  Indices use the same row-major order as ``lwx_index``. Two nodes belong to
+  the same block when the connected-air search used by `get_vf` can place them
+  in the same enclosure. The transitive closure is used so the returned blocks
+  are disjoint even when a wall touches more than one connected air region.
+
+  Args:
+    indexed_floor_plan: Floor plan using the simulator's internal values.
+    interior_wall_mask: Radiating interior-wall nodes.
+    interior_mass_mask: Optional radiating interior-mass nodes.
+    marked_value: Temporary value used to mark enclosure walls.
+    interior_mass_value: Temporary value used to mark enclosure mass nodes.
+
+  Returns:
+    Disjoint arrays of global radiative-node indices, ordered by their first
+    node. Concatenating and sorting the arrays yields ``range(n_nodes)``.
+  """
+  if interior_mass_mask is None:
+    interior_mass_mask = np.zeros_like(interior_wall_mask, dtype=bool)
+  if (
+      indexed_floor_plan.shape != interior_wall_mask.shape
+      or indexed_floor_plan.shape != interior_mass_mask.shape
+  ):
+    raise ValueError('Floor plan and radiative masks must have the same shape.')
+
+  radiative_mask = interior_wall_mask | interior_mass_mask
+  positions = np.argwhere(radiative_mask)
+  node_count = len(positions)
+  parents = np.arange(node_count)
+
+  def find(node: int) -> int:
+    while parents[node] != node:
+      parents[node] = parents[parents[node]]
+      node = int(parents[node])
+    return node
+
+  def union(first: int, second: int) -> None:
+    first_root = find(first)
+    second_root = find(second)
+    if first_root != second_root:
+      parents[second_root] = first_root
+
+  for node, position in enumerate(positions):
+    marked_floor_plan, _ = mark_air_connected_interior_walls(
+        indexed_floor_plan,
+        tuple(position),
+        marked_value=marked_value,
+        also_mark_air=bool(np.any(interior_mass_mask)),
+        air_marked_value=interior_mass_value,
+    )
+    in_enclosure = marked_floor_plan == marked_value
+    if np.any(interior_mass_mask):
+      in_enclosure |= marked_floor_plan == interior_mass_value
+    connected_nodes = np.flatnonzero(in_enclosure[radiative_mask])
+    if connected_nodes.size == 0:
+      connected_nodes = np.array([node])
+    for connected_node in connected_nodes:
+      union(node, int(connected_node))
+
+  groups: dict[int, list[int]] = {}
+  for node in range(node_count):
+    groups.setdefault(find(node), []).append(node)
+  return tuple(
+      np.asarray(nodes, dtype=int)
+      for nodes in sorted(groups.values(), key=lambda nodes: nodes[0])
+  )
+
+
 def fix_view_factors(F: np.ndarray, A: np.ndarray = None) -> np.ndarray:
   """
   Fix approximate view factors and enforce reciprocity and completeness.
@@ -368,7 +696,7 @@ def fix_view_factors(F: np.ndarray, A: np.ndarray = None) -> np.ndarray:
       Fixed view factor matrix
 
   References:
-      See `FixViewFactors` function in [EnergyPlus](https://github.com/NREL/EnergyPlus/blob/develop/src/EnergyPlus/HeatBalanceIntRadExchange.cc) # pylint: disable=line-too-long
+      See `FixViewFactors` function in [EnergyPlus](https://github.com/NatLabRockies/EnergyPlus/blob/develop/src/EnergyPlus/HeatBalanceIntRadExchange.cc) # pylint: disable=line-too-long
   """
 
   # Parameter definitions
@@ -397,6 +725,13 @@ def fix_view_factors(F: np.ndarray, A: np.ndarray = None) -> np.ndarray:
   # OriginalCheckValue is the first pass at a completeness check
   results['original_check_value'] = abs(np.sum(F) - N)
 
+  # EnergyPlus converges the fix on |sum(F) - N|, which is one number for the
+  # whole enclosure. get_vf hands over rows that each sum to exactly one, so
+  # that test is already satisfied before the loop starts and the routine
+  # returns after the single pass that trades the row closure away for
+  # reciprocity - the rows come back out anywhere between 0.71 and 2.17.
+  # Converge on the worst row instead, which is the quantity the enclosure
+  # balance depends on. The global sum is kept for reporting.
   # Allocate and initialize arrays
   FixedAF = F.copy()  # store for largest area check
 
@@ -492,7 +827,7 @@ def fix_view_factors(F: np.ndarray, A: np.ndarray = None) -> np.ndarray:
             FixedF[j, i] = 0.0
             FixedAF[j, i] = 0.0
 
-    ConvrgNew = abs(np.sum(FixedF) - N)
+    ConvrgNew = np.max(np.abs(np.sum(FixedF, axis=0) - 1.0))
 
     # Check convergence
     if (
@@ -520,27 +855,22 @@ def fix_view_factors(F: np.ndarray, A: np.ndarray = None) -> np.ndarray:
       )
       results['row_sum'] = sum_FixedF
 
-      if abs(results['fixed_check_value']) < abs(
-          results['original_check_value']
-      ):
-        F[:] = FixedF
-        results['final_check_value'] = results['fixed_check_value']
+      F[:] = FixedF
+      results['final_check_value'] = results['fixed_check_value']
 
       return F.T
 
-  # Normal completion
+  # Normal completion. The loop always ends on a reciprocity pass, and exact
+  # reciprocity is what makes the enclosure conserve energy: with A_i F_ij =
+  # A_j F_ji the pairwise exchange between any two surfaces is equal and
+  # opposite, so the heat the enclosure gains sums to zero. Closure cannot be
+  # had at the same time on a floor plan whose line of sight view factors do
+  # not close, so keep the reciprocal matrix and report how far the rows are
+  # from one.
   results['fixed_check_value'] = ConvrgNew
-
-  if results['fixed_check_value'] < results['original_check_value']:
-    F[:] = FixedF
-    results['final_check_value'] = results['fixed_check_value']
-  else:
-    results['final_check_value'] = results['original_check_value']
-    results['row_sum'] = np.sum(FixedF)
-
-    if abs(results['row_sum'] - N) < PRIMARY_CONVERGENCE:
-      F[:] = FixedF
-      results['final_check_value'] = results['fixed_check_value']
+  results['row_sum'] = np.sum(FixedF)
+  F[:] = FixedF
+  results['final_check_value'] = ConvrgNew
 
   if severe_error_present:
     raise RuntimeError(
@@ -555,7 +885,7 @@ def fix_view_factors(F: np.ndarray, A: np.ndarray = None) -> np.ndarray:
 def get_vf(
     indexed_floor_plan: np.ndarray,
     interior_wall_mask: np.ndarray,
-    view_factor_method: str = 'ScriptF',
+    view_factor_method: str = 'AreaRatio',
     marked_value: int = TEMPORARY_MARKED_VALUE,
     interior_mass_mask: np.ndarray | None = None,
     interior_mass_value: int = AIR_IN_LINE_OF_SIGHT,
@@ -563,11 +893,28 @@ def get_vf(
   """
   Calculate view factors between interior walls in the floor plan.
 
+  Two methods are available, both of which take the enclosure of a surface to
+  be the set of surfaces reachable through the same connected air space, so a
+  doorway merges the rooms it joins:
+
+  - `"AreaRatio"` (default) distributes each row by area, following the
+    EnergyPlus `CalcApproximateViewFactors` approach. Since every CV in the
+    grid has the same face area this reduces to a uniform `1 / (n - 1)` over
+    the enclosure. Rows close to one and, with equal areas, reciprocity holds
+    exactly, so `fix_view_factors` leaves the matrix alone.
+  - `"ScriptF"` additionally removes surfaces that are occluded, keeping only
+    those within an unblocked line of sight. Rows still close to one, but the
+    number of visible surfaces depends on where a surface sits in the room,
+    which violates reciprocity: two surfaces that see each other disagree
+    about how much of their emission the other receives, and
+    `fix_view_factors` then has to trade closure away to repair it.
+
   Args:
       indexed_floor_plan (np.ndarray): 2D array representing the floor plan with
           indexed values.
       view_factor_method (str, optional): Method to use for view factors.
-          Defaults to 'ScriptF'. Either "ScriptF" or "CarrollMRT".
+          Defaults to 'AreaRatio'. Either "AreaRatio", "ScriptF" or
+          "CarrollMRT".
       marked_value (int, optional): Value used to mark connected interior walls.
           Only used internally. Defaults to -33.
       interior_mass_mask (Optional[np.ndarray], optional): Mask for interior
@@ -579,22 +926,44 @@ def get_vf(
           `i` to wall `j`.
 
   """
-  if view_factor_method == 'ScriptF':
-    if interior_mass_mask is not None:
-      interior_wall_mask_all = interior_wall_mask | interior_mass_mask
-    else:
-      interior_wall_mask_all = interior_wall_mask
+  if interior_mass_mask is not None:
+    interior_wall_mask_all = interior_wall_mask | interior_mass_mask
+  else:
+    interior_wall_mask_all = interior_wall_mask
 
-    n_interior_wall = np.sum(interior_wall_mask_all)
-    interior_wall_tuples = [
-        (r, c)
-        for r in range(indexed_floor_plan.shape[0])
-        for c in range(indexed_floor_plan.shape[1])
-        if interior_wall_mask_all[r, c]
-    ]
+  n_interior_wall = np.sum(interior_wall_mask_all)
+  interior_wall_tuples = [
+      (r, c)
+      for r in range(indexed_floor_plan.shape[0])
+      for c in range(indexed_floor_plan.shape[1])
+      if interior_wall_mask_all[r, c]
+  ]
+  vf = np.zeros((n_interior_wall, n_interior_wall))
 
-    vf = np.zeros((n_interior_wall, n_interior_wall))
+  if view_factor_method == 'AreaRatio':
+    for i in range(n_interior_wall):
+      result_floor_plan, _ = mark_air_connected_interior_walls(
+          indexed_floor_plan,
+          interior_wall_tuples[i],
+          marked_value=marked_value,
+          also_mark_air=interior_mass_mask is not None,
+          air_marked_value=interior_mass_value,
+      )
+      in_enclosure = result_floor_plan == marked_value
+      if interior_mass_mask is not None:
+        in_enclosure = in_enclosure | (result_floor_plan == interior_mass_value)
 
+      # Every CV in the grid has the same face area, so the area ratio
+      # A_j / sum_{k != i} A_k reduces to a uniform 1 / (n - 1) over the
+      # enclosure. A surface does not see itself.
+      row = in_enclosure[interior_wall_mask_all].astype(float)
+      row[i] = 0.0
+      row_total = row.sum()
+      if row_total > 0.0:
+        row /= row_total
+      vf[i, :] = row
+
+  elif view_factor_method == 'ScriptF':
     for i in range(n_interior_wall):
       result_floor_plan, _ = mark_air_connected_interior_walls(
           indexed_floor_plan, interior_wall_tuples[i]
@@ -625,8 +994,8 @@ def get_vf(
     raise NotImplementedError('CarrollMRT view factor method not implemented')
   else:
     raise ValueError(
-        f'Invalid view factor method: {view_factor_method}. Either "ScriptF" or'
-        ' "CarrollMRT"'
+        f'Invalid view factor method: {view_factor_method}. Either "AreaRatio",'
+        ' "ScriptF" or "CarrollMRT"'
     )
 
   vf = fix_view_factors(vf)
